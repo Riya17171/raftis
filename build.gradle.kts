@@ -28,6 +28,7 @@ application {
 
 tasks.test {
     useJUnitPlatform()
+    maxHeapSize = "1g" // the linearizability checker keeps its search states in memory
     // The crash test starts the server as a separate process and needs this classpath.
     systemProperty("raftis.serverClasspath", sourceSets["main"].runtimeClasspath.asPath)
     // Pass -Draftis.* options (crashRuns, simSeeds, simSeed...) from the command line to the tests.

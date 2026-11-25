@@ -6,6 +6,8 @@ A Redis-compatible database written from scratch in plain Java 21 (no frameworks
 
 Plain Redis replicates asynchronously, so a failover can lose writes the client was already told succeeded. Here, killing the leader with `kill -9` loses nothing: the cluster elects a new leader in about 200 ms and keeps serving. Real `redis-cli`, `redis-benchmark` and client libraries such as Jedis work with it unchanged.
 
+It is tested the way distributed databases are tested in industry: a **Jepsen-style chaos test** partitions the network, crashes and freezes nodes while 10 clients hammer the cluster, and a **linearizability checker** I wrote proves every recorded result could have come from a single correct copy of the data.
+
 ## Quickstart
 
 **A 3-node cluster on one machine:**
@@ -20,6 +22,15 @@ scripts/cluster.sh kill 2                  # SIGKILL a node (try the leader)
 scripts/cluster.sh status                  # a new leader is elected in ~200 ms; no data lost
 scripts/cluster.sh restart 2               # it rejoins and catches up automatically
 scripts/cluster.sh stop
+```
+
+**With Docker** (nothing else needed):
+
+```bash
+docker compose up --build -d     # nodes on ports 6380, 6381, 6382
+docker compose kill node1        # crash a node; the others elect a leader
+docker compose start node1       # it rejoins and catches up
+scripts/docker-smoke.sh          # the automated version of the above, also run in CI
 ```
 
 **A single standalone server** (no replication; append-only file for durability):
@@ -123,9 +134,10 @@ This is single-node mode, without Raft.
 ## Testing
 
 ```bash
-./gradlew test                                                  # 44 tests, about 25 s
+./gradlew test                                                  # 55 tests, about 75 s
 ./gradlew test --tests '*RaftSimulationTest*' -Draftis.simSeeds=3000
 ./gradlew test --tests '*ClusterCrashTest*' -Draftis.clusterCrashRuns=20
+./gradlew test --tests '*ChaosTest*' -Draftis.chaosSeconds=600  # report in build/chaos/
 ```
 
 **Deterministic simulation.** `RaftSimulationTest` runs whole 3- and 5-node clusters on simulated time. The simulated network drops, duplicates, delays and reorders messages, and nodes are crashed, quick-rebooted, partitioned and cut off one way, all driven by one seed, so any failure replays exactly. It checks the following continuously:
@@ -152,6 +164,48 @@ This is single-node mode, without Raft.
 | **The vote isn't saved to disk before replying** | **`RaftScenarioTest`**: a node votes, reboots, and is asked again |
 
 The random simulation missed the last two in thousands of runs, because each needs an exact sequence of events. That's why they have hand-written scenario tests.
+
+**Chaos testing (Jepsen-style).** The simulation tests the Raft algorithm; `ChaosTest` tests the real system: 5 server processes with real sockets, disks and fsync. Every Raft connection between nodes runs through a TCP proxy in the test (`FaultyNetwork`), so the test can cut any link in either direction. A cut link silently drops bytes, as a real partition does, rather than resetting the connection. A nemesis injects one fault at a time, for 1–4 s each:
+
+| Fault | What happens |
+|---|---|
+| Isolate the leader | the leader can't reach anyone, and still believes it leads |
+| Split, bridge | a minority/majority split, or two halves joined only through one node |
+| One-way partition | a node hears everyone, but nothing it sends arrives |
+| `kill -9` the leader, a random node, or **3 of 5 nodes at once** | crash, then restart from disk |
+| `SIGSTOP` the leader or a random node | frozen mid-instruction like a long GC pause, then resumed, unaware time passed |
+
+Meanwhile 10 clients run reads, writes and `INCR`s on 5 shared keys, recording when each operation started and finished, and its result. Snapshots are forced every 200 entries, so compaction and `InstallSnapshot` happen in the middle of faults. Afterwards the test checks four things:
+- the whole history is **linearizable**;
+- the cluster serves writes again once the faults stop;
+- all 5 replicas hold identical data;
+- no client ever got an unexpected error.
+
+> **A 10-minute run: 137 faults, including 21 crashes of 3 of 5 nodes at once and 19 leader freezes; 511 terms; 98,585 successful operations, plus 931 with no answer. Every key was proven linearizable, in about 76 ms each, and all replicas ended identical.** A 60-second run is part of CI on every push, and its report is saved as a build artifact.
+
+**The linearizability checker** (`LinearizabilityChecker`) uses the Wing & Gong search with Lowe's memoization, the algorithm behind Jepsen's Knossos and Porcupine. It looks for one order of all operations that respects real time and gives every client the answer it actually got. Three details make it practical:
+- **Per key.** It checks each key on its own, in parallel, which is valid because linearizability is compositional.
+- **Unknown outcomes.** An operation that timed out may have happened at any point after it started, or never.
+- **Pruning.** Timed-out writes whose value nobody ever read are dropped, which keeps partitions from blowing up the search.
+
+It has its own tests with the classic anomalies: stale reads, new-then-old read inversion, lost and duplicated increments, and one bad read hidden in 5,000 operations.
+
+**Does it catch real bugs?** `READMODE LEADER` skips the ReadIndex majority check. In 30-second chaos runs using that mode, the checker found stale reads in **7 of 10 runs, including every run that isolated the leader (6 of 6)**. The 3 runs that passed never left a deposed leader running and reachable by clients. It pinpoints the exact operations, for example:
+
+```
+no valid order exists for key k1 (1525 operations)
+  and then this one can never be placed:
+    client 4  read  k1 -> 10000157000000   [21.246s .. 21.246s]
+  operations overlapping it, or just before it:
+    client 9  write k1 = 9000167000000     [21.116s .. 21.166s]
+    client 1  write k1 = 1000168000000     [21.149s .. 21.195s]
+```
+
+A leader cut off from the cluster answered from memory after 4 newer writes had been acknowledged elsewhere. With the default `CONSISTENT` mode, every run passes. `aCutOffLeaderServesStaleReadsUnlessReadsGoThroughReadIndex` reproduces this exact situation deterministically.
+
+**Lessons from building it:**
+- **The first version of the chaos test couldn't find this bug.** Clients only changed nodes after an error, so once a new leader existed, nobody talked to the old one. Now clients occasionally reconnect to a random node, as clients behind a load balancer do. The `LEADER` mode experiment is what exposed the blind spot.
+- **Setting up Docker exposed a real bug:** peers' host names were resolved only once, at startup. A container that started before its peers existed in DNS, or that came back with a new IP after a restart, could never be reached. Now every reconnect looks the name up again.
 
 **Real processes and real disks:**
 
@@ -186,10 +240,11 @@ Standalone mode vs Redis 8.12: about equal without pipelining (both are limited 
 - **No PreVote or CheckQuorum.** A node that rejoins after a partition can force an unnecessary election.
 - **Retries can apply twice.** A client that retries after an `UNCERTAIN` reply can apply an `INCR` twice. The fix is client sessions with sequence numbers (Raft thesis §6.3).
 - **Snapshots block.** They are taken on the event loop and sent as one message, not in chunks.
-- **Single machine only so far.** The cluster has been tested on one machine, not across a real network with real partitions. That's Phase 4.
+- **Partitions are simulated at the TCP level.** The chaos test runs every node on one machine and cuts links with a proxy. There's no packet-level loss or latency, and no clock skew.
+- **Snapshots are resent to unreachable followers.** The leader resends a snapshot to a follower it can't reach after every compaction; etcd waits for the follower to answer first.
 - **Narrower feature set than Redis.** Pub/sub stays on one node, there's no auth and only one database. There's no `MULTI`/`EXEC`, Lua scripting or cluster sharding.
 
 ## Roadmap
 
-1. **Chaos testing:** Docker, network partitions, and history checking with the Porcupine linearizability checker
-2. **Observability:** Prometheus metrics and a live cluster visualizer (kill a node and watch the cluster recover)
+1. **Observability:** Prometheus metrics and a live cluster visualizer (kill a node and watch the cluster recover)
+2. **PreVote and CheckQuorum**, so a returning node can't disrupt a healthy leader

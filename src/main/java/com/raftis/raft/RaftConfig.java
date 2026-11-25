@@ -20,4 +20,8 @@ public record RaftConfig(int electionTicksMin, int electionTicksMax, int heartbe
     public static RaftConfig defaults() {
         return new RaftConfig(15, 30, 5, 1000, 100_000);
     }
+
+    public RaftConfig withSnapshotThreshold(long entries) {
+        return new RaftConfig(electionTicksMin, electionTicksMax, heartbeatTicks, maxEntriesPerMessage, entries);
+    }
 }

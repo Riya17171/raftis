@@ -119,7 +119,9 @@ public final class Server {
                 if (!fsync) Log.warn("fsync is OFF: acknowledged writes can be lost on power failure (benchmarking only)");
                 raftStorage = FileRaftStorage.open(config.dir(), fsync);
                 raftKv = new RaftKv(this, db, cluster);
-                raft = new RaftNode(cluster.selfId(), cluster.peerIds(), RaftConfig.defaults(), raftStorage, raftKv, new Random());
+                RaftConfig raftConfig = RaftConfig.defaults();
+                if (config.snapshotEntries() > 0) raftConfig = raftConfig.withSnapshotThreshold(config.snapshotEntries());
+                raft = new RaftNode(cluster.selfId(), cluster.peerIds(), raftConfig, raftStorage, raftKv, new Random());
                 raftKv.attach(raft);
                 transport = new PeerTransport(selector, cluster.peerAddresses(), raft::step);
                 transport.bind(new InetSocketAddress(config.bind(), cluster.self().raftPort()));

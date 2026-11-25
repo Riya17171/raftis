@@ -168,6 +168,9 @@ final class ServerCommands {
             line(sb, "last_log_index", raft.lastLogIndex());
             line(sb, "snapshot_index", raft.snapshotIndex());
             line(sb, "connected_peers", s.connectedPeers());
+            line(sb, "elections_started", raft.electionsStarted());
+            line(sb, "snapshots_sent", raft.snapshotsSent());
+            line(sb, "snapshots_installed", raft.snapshotsInstalled());
             if (raft.isLeader()) {
                 raft.matchIndexes().entrySet().stream().sorted(Map.Entry.comparingByKey())
                         .forEach(e -> line(sb, "peer_" + e.getKey() + "_match_index", e.getValue()));

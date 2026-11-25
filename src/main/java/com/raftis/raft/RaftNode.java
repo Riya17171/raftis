@@ -76,6 +76,11 @@ public final class RaftNode {
     private long lastApplied;
     private long durableIndex; // our own log is on disk up to here
 
+    // Counters since this process started, for INFO and the chaos test report.
+    private long electionsStarted;
+    private long snapshotsSent;
+    private long snapshotsInstalled;
+
     private int electionElapsed;
     private int electionTimeout;
     private int heartbeatElapsed;
@@ -210,6 +215,7 @@ public final class RaftNode {
     // ------------------------------------------------------------------ elections
 
     private void startElection() {
+        electionsStarted++;
         role = Role.CANDIDATE;
         term++;
         votedFor = id;
@@ -310,6 +316,7 @@ public final class RaftNode {
 
     private void sendSnapshot(int peer) {
         RaftSnapshot snapshot = storage.snapshot();
+        snapshotsSent++;
         send(new InstallSnapshot(id, peer, term, snapshot.index(), snapshot.term(), snapshot.data(), readSeq));
         nextIndex.put(peer, snapshot.index() + 1);
     }
@@ -446,6 +453,7 @@ public final class RaftNode {
         if (is.lastIncludedIndex() > commitIndex) {
             log.installSnapshot(is.lastIncludedIndex(), is.lastIncludedTerm(), is.data());
             stateMachine.restore(is.data());
+            snapshotsInstalled++;
             commitIndex = is.lastIncludedIndex();
             lastApplied = is.lastIncludedIndex();
             durableIndex = log.lastIndex();
@@ -554,6 +562,18 @@ public final class RaftNode {
 
     public long snapshotIndex() {
         return log.snapshotIndex();
+    }
+
+    public long electionsStarted() {
+        return electionsStarted;
+    }
+
+    public long snapshotsSent() {
+        return snapshotsSent;
+    }
+
+    public long snapshotsInstalled() {
+        return snapshotsInstalled;
     }
 
     /** How far each follower's log is known to match ours (leader only). */

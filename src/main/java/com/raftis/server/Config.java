@@ -5,12 +5,22 @@ import com.raftis.raft.ClusterConfig;
 
 import java.nio.file.Path;
 
-/** Server settings, parsed from command-line flags. */
-public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster) {
+/**
+ * Server settings, parsed from command-line flags.
+ *
+ * @param snapshotEntries cluster mode: take a snapshot after this many log entries (0 = the default)
+ */
+public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster,
+                     long snapshotEntries) {
 
     /** A standalone (non-cluster) configuration. */
     public Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync) {
-        this(bind, port, dir, appendOnly, fsync, null);
+        this(bind, port, dir, appendOnly, fsync, null, 0);
+    }
+
+    /** A cluster configuration with default Raft settings. */
+    public Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster) {
+        this(bind, port, dir, appendOnly, fsync, cluster, 0);
     }
 
     public static final String USAGE = """
@@ -25,14 +35,21 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
               --node-id <n>                       this node's id
               --cluster <members>                 every node as id=host:clientPort:raftPort, comma-separated
                                                   e.g. 1=127.0.0.1:6380:7380,2=127.0.0.1:6381:7381,3=127.0.0.1:6382:7382
-                                                  (the node's own entry sets its ports; --port is ignored)""";
+                                                  (the node's own entry sets its ports; --port is ignored)
+              --snapshot-entries <n>              compact the Raft log every n entries (default 100000)""";
 
     public static Config defaults() {
         return new Config("127.0.0.1", 6380, Path.of("data"), true, FsyncPolicy.EVERYSEC);
     }
 
     public static Config parse(String[] args) {
-        Config c = defaults();
+        Config d = defaults();
+        String bind = d.bind;
+        int port = d.port;
+        Path dir = d.dir;
+        boolean appendOnly = d.appendOnly;
+        FsyncPolicy fsync = d.fsync;
+        long snapshotEntries = 0;
         Integer nodeId = null;
         String members = null;
         for (int i = 0; i < args.length; i++) {
@@ -40,28 +57,32 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
             if (i + 1 >= args.length) throw new IllegalArgumentException("missing value for " + flag);
             String value = args[++i];
             switch (flag) {
-                case "--port" -> c = new Config(c.bind, parsePort(value), c.dir, c.appendOnly, c.fsync);
-                case "--bind" -> c = new Config(value, c.port, c.dir, c.appendOnly, c.fsync);
-                case "--dir" -> c = new Config(c.bind, c.port, Path.of(value), c.appendOnly, c.fsync);
-                case "--appendonly" -> c = new Config(c.bind, c.port, c.dir, parseYesNo(flag, value), c.fsync);
-                case "--appendfsync" -> c = new Config(c.bind, c.port, c.dir, c.appendOnly, FsyncPolicy.parse(value));
-                case "--node-id" -> nodeId = parseNodeId(value);
+                case "--port" -> port = parsePort(value);
+                case "--bind" -> bind = value;
+                case "--dir" -> dir = Path.of(value);
+                case "--appendonly" -> appendOnly = parseYesNo(flag, value);
+                case "--appendfsync" -> fsync = FsyncPolicy.parse(value);
+                case "--node-id" -> nodeId = parseInt("node id", value);
                 case "--cluster" -> members = value;
+                case "--snapshot-entries" -> {
+                    snapshotEntries = parseInt("--snapshot-entries", value);
+                    if (snapshotEntries <= 0) throw new IllegalArgumentException("--snapshot-entries must be positive");
+                }
                 default -> throw new IllegalArgumentException("unknown option " + flag);
             }
         }
         if ((nodeId == null) != (members == null)) {
             throw new IllegalArgumentException("--node-id and --cluster must be used together");
         }
-        if (nodeId == null) return c;
-        return new Config(c.bind, c.port, c.dir, c.appendOnly, c.fsync, ClusterConfig.parse(nodeId, members));
+        ClusterConfig cluster = nodeId == null ? null : ClusterConfig.parse(nodeId, members);
+        return new Config(bind, port, dir, appendOnly, fsync, cluster, snapshotEntries);
     }
 
-    private static int parseNodeId(String value) {
+    private static int parseInt(String what, String value) {
         try {
             return Integer.parseInt(value);
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("invalid node id " + value);
+            throw new IllegalArgumentException("invalid " + what + " " + value);
         }
     }
 

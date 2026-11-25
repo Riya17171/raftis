@@ -1,0 +1,35 @@
+# A 3-node raftis cluster:   docker compose up --build -d
+# Client ports on this machine: 6380 (node1), 6381 (node2), 6382 (node3).
+# A follower answers writes with "NOTLEADER node2:6381": connect to that port (6381) instead.
+#
+# Try a failover:
+#   docker compose kill node1      # SIGKILL, like a crash
+#   docker compose start node1     # it rejoins and catches up
+x-node: &node
+  image: raftis:local
+  build: .
+  stop_grace_period: 5s
+
+x-members: &members "1=node1:6380:7380,2=node2:6381:7381,3=node3:6382:7382"
+
+services:
+  node1:
+    <<: *node
+    command: ["--node-id", "1", "--cluster", *members]
+    ports: ["6380:6380"]
+    volumes: ["node1:/data"]
+  node2:
+    <<: *node
+    command: ["--node-id", "2", "--cluster", *members]
+    ports: ["6381:6381"]
+    volumes: ["node2:/data"]
+  node3:
+    <<: *node
+    command: ["--node-id", "3", "--cluster", *members]
+    ports: ["6382:6382"]
+    volumes: ["node3:/data"]
+
+volumes:
+  node1:
+  node2:
+  node3:

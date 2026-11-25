@@ -10,6 +10,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.channels.UnresolvedAddressException;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -171,7 +172,8 @@ public final class PeerTransport {
     /** Our connection to a peer. We only write messages to it. */
     final class Outbound implements Endpoint {
         private final int peerId;
-        private final InetSocketAddress address;
+        private final String host;
+        private final int port;
         private final ArrayDeque<ByteBuffer> queue = new ArrayDeque<>();
         private final ByteBuffer scratch = ByteBuffer.allocate(256);
         private SocketChannel channel;
@@ -183,7 +185,8 @@ public final class PeerTransport {
 
         Outbound(int peerId, InetSocketAddress address) {
             this.peerId = peerId;
-            this.address = address;
+            this.host = address.getHostString();
+            this.port = address.getPort();
         }
 
         void enqueue(byte[] message) {
@@ -213,12 +216,14 @@ public final class PeerTransport {
                 channel = SocketChannel.open();
                 channel.configureBlocking(false);
                 channel.setOption(StandardSocketOptions.TCP_NODELAY, true);
-                if (channel.connect(address)) {
+                // Look the host name up again on every attempt: in Docker or Kubernetes a peer may not
+                // be in DNS yet when we start, and a restarted peer can come back with a new IP address.
+                if (channel.connect(new InetSocketAddress(host, port))) {
                     onConnected();
                 } else {
                     key = channel.register(selector, SelectionKey.OP_CONNECT, this);
                 }
-            } catch (IOException e) {
+            } catch (IOException | UnresolvedAddressException e) {
                 disconnect(now);
             }
         }
@@ -242,7 +247,7 @@ public final class PeerTransport {
         private void onConnected() throws IOException {
             connected = true;
             key = channel.register(selector, SelectionKey.OP_READ, this); // read only to notice when it closes
-            if (warnedDown) Log.info("raft: connected to node %d at %s", peerId, address);
+            if (warnedDown) Log.info("raft: connected to node %d at %s:%d", peerId, host, port);
             warnedDown = false;
         }
 
@@ -262,7 +267,7 @@ public final class PeerTransport {
 
         void disconnect(long now) {
             if (connected && !warnedDown) {
-                Log.warn("raft: lost connection to node %d at %s", peerId, address);
+                Log.warn("raft: lost connection to node %d at %s:%d", peerId, host, port);
                 warnedDown = true;
             }
             connected = false;
