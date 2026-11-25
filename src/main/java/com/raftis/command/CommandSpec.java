@@ -13,6 +13,8 @@ public record CommandSpec(String name, int arity, int flags, Handler handler) {
     public static final int WRITE = 1;
     /** Allowed while the client is subscribed to pub/sub channels. */
     public static final int PUBSUB = 1 << 1;
+    /** Never touches the dataset (PING, INFO, CLIENT...). In cluster mode it runs right away on any node. */
+    public static final int LOCAL = 1 << 2;
 
     @FunctionalInterface
     public interface Handler {

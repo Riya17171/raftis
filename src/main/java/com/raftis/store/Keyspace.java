@@ -1,7 +1,10 @@
 package com.raftis.store;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
@@ -25,6 +28,14 @@ import java.util.function.LongSupplier;
  * <p>While loading data from disk, time is frozen: nothing expires. Replaying the log must
  * rebuild exactly the state that existed, including keys whose TTL passed while the server was
  * down; they are expired normally once loading finishes. Redis does the same.
+ *
+ * <p><b>Cluster mode</b> adds two switches, because every node must make identical changes:
+ * <ul>
+ *   <li>{@link #setFixedTime}: while applying a Raft log entry, "now" is the timestamp the leader
+ *       put in that entry, not this machine's clock, so every node makes the same expiry decisions.</li>
+ *   <li>{@link #setReadOnly}: while serving a read, an expired key is reported missing but not
+ *       deleted. Deleting it would change this node's data outside the log.</li>
+ * </ul>
  */
 public final class Keyspace {
     private static final int SAMPLE_SIZE = 20;
@@ -35,6 +46,8 @@ public final class Keyspace {
     private final LongSupplier clock;
     private final Random random = new Random();
     private boolean loading;
+    private boolean readOnly;
+    private long fixedTime = -1;
     private long expiredKeys;
 
     public Keyspace(LongSupplier clock) {
@@ -42,12 +55,12 @@ public final class Keyspace {
     }
 
     public long now() {
-        return clock.getAsLong();
+        return fixedTime >= 0 ? fixedTime : clock.getAsLong();
     }
 
-    /** Looks up a key, deleting it first if its TTL has passed. */
+    /** Looks up a key. An expired key is deleted (unless read-only) and reported missing. */
     public Object get(ByteKey key) {
-        expireIfNeeded(key);
+        if (expireIfNeeded(key)) return null;
         return data.get(key);
     }
 
@@ -123,6 +136,43 @@ public final class Keyspace {
         this.loading = loading;
     }
 
+    /** Makes {@link #now()} return {@code time} (a Raft entry's timestamp) until {@link #clearFixedTime()}. */
+    public void setFixedTime(long time) {
+        this.fixedTime = time;
+    }
+
+    public void clearFixedTime() {
+        this.fixedTime = -1;
+    }
+
+    /** While read-only, expired keys look missing but are not deleted. */
+    public void setReadOnly(boolean readOnly) {
+        this.readOnly = readOnly;
+    }
+
+    /**
+     * Cluster-mode active expiry: finds keys whose TTL has passed, without deleting them. The
+     * leader then deletes them through the Raft log so every node deletes the same keys.
+     */
+    public List<ByteKey> sampleExpiredKeys(int max) {
+        List<ByteKey> found = new ArrayList<>();
+        Set<ByteKey> seen = new HashSet<>();
+        long now = now();
+        for (int round = 0; round < 16 && expires.size() > 0 && found.size() < max; round++) {
+            int sample = Math.min(SAMPLE_SIZE, expires.size());
+            int expired = 0;
+            for (int i = 0; i < sample; i++) {
+                ExpiryIndex.Entry e = expires.random(random);
+                if (e.at <= now) {
+                    expired++;
+                    if (seen.add(e.key)) found.add(e.key);
+                }
+            }
+            if (expired * 4 <= sample) break;
+        }
+        return found;
+    }
+
     /**
      * Redis's active expiry algorithm: sample 20 random keys that have a TTL and delete the
      * expired ones. If more than 25% were expired, there are probably many more, so repeat,
@@ -153,10 +203,13 @@ public final class Keyspace {
         return total;
     }
 
+    /** Returns true if the key has expired, deleting it unless read-only. */
     private boolean expireIfNeeded(ByteKey key) {
         if (!isExpired(key)) return false;
-        removeKey(key);
-        expiredKeys++;
+        if (!readOnly) {
+            removeKey(key);
+            expiredKeys++;
+        }
         return true;
     }
 

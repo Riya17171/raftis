@@ -6,10 +6,17 @@ import com.raftis.command.CommandException;
 import com.raftis.command.CommandSpec;
 import com.raftis.command.CommandTable;
 import com.raftis.command.Context;
+import com.raftis.persistence.FsyncPolicy;
 import com.raftis.persistence.Persistence;
 import com.raftis.protocol.ProtocolException;
 import com.raftis.protocol.RespParser;
 import com.raftis.protocol.RespWriter;
+import com.raftis.raft.ClusterConfig;
+import com.raftis.raft.FileRaftStorage;
+import com.raftis.raft.Message;
+import com.raftis.raft.PeerTransport;
+import com.raftis.raft.RaftConfig;
+import com.raftis.raft.RaftNode;
 import com.raftis.store.Keyspace;
 
 import java.io.IOException;
@@ -25,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -51,8 +59,9 @@ import java.util.concurrent.TimeUnit;
  * </ol>
  */
 public final class Server {
-    public static final String VERSION = "0.1.0";
+    public static final String VERSION = "0.2.0";
     private static final long EXPIRE_CYCLE_MS = 100;
+    private static final long RAFT_TICK_MS = 10;
     private static final int PUBSUB_OUTPUT_LIMIT = 32 * 1024 * 1024; // like Redis's pubsub buffer limit
 
     private final Config config;
@@ -76,6 +85,13 @@ public final class Server {
     private long totalCommands;
     private long totalConnections;
 
+    // Cluster mode only (null when running as a single standalone server).
+    private RaftNode raft;
+    private RaftKv raftKv;
+    private FileRaftStorage raftStorage;
+    private PeerTransport transport;
+    private long nextTick;
+
     public Server(Config config) {
         this.config = config;
         this.persistence = new Persistence(config.dir(), config.appendOnly(), config.fsync());
@@ -86,13 +102,30 @@ public final class Server {
         try {
             selector = Selector.open();
             listener = ServerSocketChannel.open();
-            listener.bind(new InetSocketAddress(config.bind(), config.port()), 511);
+            ClusterConfig cluster = config.cluster();
+            int clientPort = cluster != null ? cluster.self().clientPort() : config.port();
+            listener.bind(new InetSocketAddress(config.bind(), clientPort), 511);
             listener.configureBlocking(false);
             listener.register(selector, SelectionKey.OP_ACCEPT);
             port = ((InetSocketAddress) listener.getLocalAddress()).getPort();
 
             long t0 = System.nanoTime();
-            persistence.load(db, this::replay);
+            if (cluster == null) {
+                persistence.load(db, this::replay);
+            } else {
+                // The Raft log replaces the append-only file: it is the durable record of every write.
+                // --appendfsync no turns off fsync for benchmarking only: it breaks durability on power loss.
+                boolean fsync = config.fsync() != FsyncPolicy.NO;
+                if (!fsync) Log.warn("fsync is OFF: acknowledged writes can be lost on power failure (benchmarking only)");
+                raftStorage = FileRaftStorage.open(config.dir(), fsync);
+                raftKv = new RaftKv(this, db, cluster);
+                raft = new RaftNode(cluster.selfId(), cluster.peerIds(), RaftConfig.defaults(), raftStorage, raftKv, new Random());
+                raftKv.attach(raft);
+                transport = new PeerTransport(selector, cluster.peerAddresses(), raft::step);
+                transport.bind(new InetSocketAddress(config.bind(), cluster.self().raftPort()));
+                Log.info("cluster mode: node %d of %d, Raft port %d, term %d, log up to index %d",
+                        cluster.selfId(), cluster.members().size(), cluster.self().raftPort(), raft.term(), raft.lastLogIndex());
+            }
             Log.info("DB loaded from disk: %d keys in %.3f seconds", db.size(), (System.nanoTime() - t0) / 1e9);
         } catch (IOException | RuntimeException e) {
             closeQuietly();
@@ -147,11 +180,17 @@ public final class Server {
 
     private void loop() throws IOException {
         while (running) {
-            long wait = Math.max(1, nextExpireCycle - System.currentTimeMillis());
-            selector.select(wait);
+            long nextTimer = raft == null ? nextExpireCycle : Math.min(nextExpireCycle, nextTick);
+            long wait = Math.max(1, nextTimer - System.currentTimeMillis());
+            if (raftKv != null && raftKv.hasResumable()) selector.selectNow();
+            else selector.select(wait);
             Set<SelectionKey> ready = selector.selectedKeys();
             for (SelectionKey key : ready) {
                 if (!key.isValid()) continue;
+                if (key.attachment() instanceof PeerTransport.Endpoint) {
+                    transport.onReady(key); // Raft traffic between nodes
+                    continue;
+                }
                 if (key.isAcceptable()) {
                     accept();
                     continue;
@@ -166,8 +205,13 @@ public final class Server {
             while ((task = tasks.poll()) != null) task.run();
 
             long now = System.currentTimeMillis();
+            if (raft != null && now >= nextTick) {
+                raft.tick();
+                nextTick = now + RAFT_TICK_MS;
+            }
             if (now >= nextExpireCycle) {
-                db.activeExpireCycle();
+                if (raft == null) db.activeExpireCycle();
+                else raftKv.expireKeys(); // cluster mode: only the leader expires keys, through the log
                 nextExpireCycle = now + EXPIRE_CYCLE_MS;
             }
             beforeSleep();
@@ -202,8 +246,8 @@ public final class Server {
     }
 
     /** Parses and runs every complete command in the input buffer (a client may pipeline many). */
-    private void processInput(Connection c) {
-        while (!c.shouldCloseAfterReply()) {
+    void processInput(Connection c) {
+        while (!c.shouldCloseAfterReply() && !c.blocked) {
             RespParser.Result parsed;
             try {
                 parsed = RespParser.parse(c.in, c.inStart, c.inEnd);
@@ -221,8 +265,18 @@ public final class Server {
     }
 
     private void execute(Connection c, List<byte[]> args) {
-        totalCommands++;
         CommandSpec cmd = commands.lookup(args.get(0));
+        if (raftKv != null && c.inflightWrites > 0) {
+            // Earlier writes from this client are still in flight. More writes can follow them into
+            // the log (their replies will come back in order); anything else must wait its turn.
+            boolean canPipeline = cmd != null && cmd.has(CommandSpec.WRITE) && cmd.arityMatches(args.size()) && raft.isLeader();
+            if (!canPipeline) {
+                c.deferred = args;
+                c.blocked = true;
+                return;
+            }
+        }
+        totalCommands++;
         if (cmd == null) {
             c.out.error("ERR unknown command '" + Args.printable(args.get(0)) + "'");
             return;
@@ -236,16 +290,57 @@ public final class Server {
                     + "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context");
             return;
         }
-        Context ctx = new Context(this, c, c.out);
-        int mark = c.out.length();
-        try {
-            cmd.handler().run(ctx, args);
-        } catch (CommandException e) {
-            c.out.truncate(mark);
-            c.out.error(e.getMessage());
+        if (raftKv != null && !cmd.has(CommandSpec.LOCAL)) {
+            if (cmd.has(CommandSpec.WRITE)) raftKv.submitWrite(c, args);
+            else raftKv.submitRead(c, cmd, args);
             return;
         }
-        if (cmd.has(CommandSpec.WRITE) && ctx.isDirty()) persistence.append(ctx.propagation(args));
+        Context ctx = runHandler(cmd, c, c.out, args);
+        if (ctx != null && raft == null && cmd.has(CommandSpec.WRITE) && ctx.isDirty()) {
+            persistence.append(ctx.propagation(args));
+        }
+    }
+
+    /** Runs a command; a CommandException becomes an error reply. Returns null if it failed. */
+    private Context runHandler(CommandSpec cmd, Connection c, RespWriter out, List<byte[]> args) {
+        Context ctx = new Context(this, c, out);
+        int mark = out.length();
+        try {
+            cmd.handler().run(ctx, args);
+            return ctx;
+        } catch (CommandException e) {
+            out.truncate(mark);
+            out.error(e.getMessage());
+            return null;
+        }
+    }
+
+    /** Cluster mode: a read on this node's memory. Must not change anything, not even lazy expiry. */
+    void executeRead(CommandSpec cmd, Connection c, List<byte[]> args) {
+        db.setReadOnly(true);
+        try {
+            runHandler(cmd, c, c.out, args);
+        } finally {
+            db.setReadOnly(false);
+        }
+    }
+
+    /** Cluster mode: applies a committed command. {@code c} is the waiting client, or null. */
+    void executeReplicated(List<byte[]> args, Connection c, RespWriter out) {
+        CommandSpec cmd = commands.lookup(args.get(0));
+        if (cmd == null || !cmd.arityMatches(args.size())) {
+            out.error("ERR invalid command in the Raft log: " + Args.printable(args.get(0)));
+            return;
+        }
+        runHandler(cmd, c, out, args);
+    }
+
+    /** Cluster mode: continue a client whose earlier command finished. */
+    void resume(Connection c) {
+        List<byte[]> deferred = c.deferred;
+        c.deferred = null;
+        if (deferred != null) execute(c, deferred);
+        processInput(c);
     }
 
     /** Re-runs a command read from the append-only file. No client, no reply, no re-logging. */
@@ -268,7 +363,24 @@ public final class Server {
      * {@code always} mode), and only then send replies.
      */
     private void beforeSleep() throws IOException {
-        persistence.flushBeforeReplies();
+        if (raft == null) {
+            persistence.flushBeforeReplies();
+        } else {
+            // 1. continue clients whose previous command finished (they may propose more writes)
+            // 2. put this pass's Raft changes on disk with one fsync (group commit)
+            // 3. only then tell Raft they're durable and send messages to the other nodes
+            // In a one-node cluster, step 2 alone commits writes, which can unblock more clients,
+            // so repeat a few times before sleeping.
+            for (int round = 0; round < 32; round++) {
+                raftKv.resumeReady();
+                raftStorage.sync();
+                raft.persisted();
+                raftKv.checkLeadership();
+                if (!raftKv.hasResumable()) break;
+            }
+            for (Message m : raft.drainOutbox()) transport.send(m);
+            transport.flush(System.currentTimeMillis());
+        }
         if (pendingWrites.isEmpty()) return;
         List<Connection> batch = new ArrayList<>(pendingWrites);
         pendingWrites.clear();
@@ -277,7 +389,7 @@ public final class Server {
         }
     }
 
-    private void queueWrite(Connection c) {
+    void queueWrite(Connection c) {
         if (c.isOpen()) pendingWrites.add(c);
     }
 
@@ -309,9 +421,14 @@ public final class Server {
         for (Connection c : new ArrayList<>(clients)) close(c);
         closeQuietly();
         try {
-            persistence.close(db);
+            if (raft != null) {
+                transport.close();
+                raftStorage.close();
+            } else {
+                persistence.close(db);
+            }
             Log.info("raftis is now ready to exit, bye bye...");
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             Log.warn("error while saving data on shutdown: %s", e);
         }
     }
@@ -361,6 +478,19 @@ public final class Server {
 
     public long uptimeSeconds() {
         return (System.currentTimeMillis() - startedAt) / 1000;
+    }
+
+    /** The Raft node in cluster mode, or null for a standalone server. */
+    public RaftNode raft() {
+        return raft;
+    }
+
+    public String leaderAddress() {
+        return raftKv == null ? "" : raftKv.leaderAddress();
+    }
+
+    public int connectedPeers() {
+        return transport == null ? 0 : transport.connectedPeers();
     }
 
     public Map<String, String> configParams() {

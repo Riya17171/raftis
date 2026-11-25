@@ -30,7 +30,10 @@ tasks.test {
     useJUnitPlatform()
     // The crash test starts the server as a separate process and needs this classpath.
     systemProperty("raftis.serverClasspath", sourceSets["main"].runtimeClasspath.asPath)
-    systemProperty("raftis.crashRuns", System.getProperty("raftis.crashRuns") ?: "10")
+    // Pass -Draftis.* options (crashRuns, simSeeds, simSeed...) from the command line to the tests.
+    System.getProperties().stringPropertyNames()
+        .filter { it.startsWith("raftis.") }
+        .forEach { systemProperty(it, System.getProperty(it)) }
     testLogging {
         events("passed", "failed", "skipped")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL

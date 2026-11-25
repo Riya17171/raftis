@@ -29,6 +29,25 @@ final class KeyCommands {
         t.add("ttl", 2, 0, (ctx, a) -> ttl(ctx, a, false));
         t.add("pttl", 2, 0, (ctx, a) -> ttl(ctx, a, true));
         t.add("persist", 2, WRITE, KeyCommands::persist);
+        t.add("raftis.expire", -2, WRITE, KeyCommands::expireNow);
+    }
+
+    /**
+     * Internal, cluster mode: the leader proposes this for keys it saw expire. Applying it on each
+     * node checks those keys against the entry's timestamp and deletes the expired ones, so every
+     * node deletes exactly the same keys. (A plain DEL could delete a newer value set meanwhile.)
+     */
+    private static void expireNow(Context ctx, List<byte[]> a) {
+        long expired = 0;
+        for (int i = 1; i < a.size(); i++) {
+            ByteKey key = Args.key(a, i);
+            if (ctx.db().isExpired(key)) {
+                ctx.db().get(key); // deletes it
+                expired++;
+            }
+        }
+        if (expired > 0) ctx.dirty();
+        ctx.out.integer(expired);
     }
 
     static String typeName(Object value) {

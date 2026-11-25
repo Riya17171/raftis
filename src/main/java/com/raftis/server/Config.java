@@ -1,11 +1,17 @@
 package com.raftis.server;
 
 import com.raftis.persistence.FsyncPolicy;
+import com.raftis.raft.ClusterConfig;
 
 import java.nio.file.Path;
 
 /** Server settings, parsed from command-line flags. */
-public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync) {
+public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster) {
+
+    /** A standalone (non-cluster) configuration. */
+    public Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync) {
+        this(bind, port, dir, appendOnly, fsync, null);
+    }
 
     public static final String USAGE = """
             usage: raftis [options]
@@ -13,7 +19,13 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
               --bind <address>                    address to listen on (default 127.0.0.1)
               --dir <path>                        where data files are stored (default ./data)
               --appendonly yes|no                 log every write to an append-only file (default yes)
-              --appendfsync always|everysec|no    when to fsync that log (default everysec)""";
+              --appendfsync always|everysec|no    when to fsync that log (default everysec)
+
+            cluster mode (Raft replication):
+              --node-id <n>                       this node's id
+              --cluster <members>                 every node as id=host:clientPort:raftPort, comma-separated
+                                                  e.g. 1=127.0.0.1:6380:7380,2=127.0.0.1:6381:7381,3=127.0.0.1:6382:7382
+                                                  (the node's own entry sets its ports; --port is ignored)""";
 
     public static Config defaults() {
         return new Config("127.0.0.1", 6380, Path.of("data"), true, FsyncPolicy.EVERYSEC);
@@ -21,20 +33,36 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
 
     public static Config parse(String[] args) {
         Config c = defaults();
+        Integer nodeId = null;
+        String members = null;
         for (int i = 0; i < args.length; i++) {
             String flag = args[i];
             if (i + 1 >= args.length) throw new IllegalArgumentException("missing value for " + flag);
             String value = args[++i];
-            c = switch (flag) {
-                case "--port" -> new Config(c.bind, parsePort(value), c.dir, c.appendOnly, c.fsync);
-                case "--bind" -> new Config(value, c.port, c.dir, c.appendOnly, c.fsync);
-                case "--dir" -> new Config(c.bind, c.port, Path.of(value), c.appendOnly, c.fsync);
-                case "--appendonly" -> new Config(c.bind, c.port, c.dir, parseYesNo(flag, value), c.fsync);
-                case "--appendfsync" -> new Config(c.bind, c.port, c.dir, c.appendOnly, FsyncPolicy.parse(value));
+            switch (flag) {
+                case "--port" -> c = new Config(c.bind, parsePort(value), c.dir, c.appendOnly, c.fsync);
+                case "--bind" -> c = new Config(value, c.port, c.dir, c.appendOnly, c.fsync);
+                case "--dir" -> c = new Config(c.bind, c.port, Path.of(value), c.appendOnly, c.fsync);
+                case "--appendonly" -> c = new Config(c.bind, c.port, c.dir, parseYesNo(flag, value), c.fsync);
+                case "--appendfsync" -> c = new Config(c.bind, c.port, c.dir, c.appendOnly, FsyncPolicy.parse(value));
+                case "--node-id" -> nodeId = parseNodeId(value);
+                case "--cluster" -> members = value;
                 default -> throw new IllegalArgumentException("unknown option " + flag);
-            };
+            }
         }
-        return c;
+        if ((nodeId == null) != (members == null)) {
+            throw new IllegalArgumentException("--node-id and --cluster must be used together");
+        }
+        if (nodeId == null) return c;
+        return new Config(c.bind, c.port, c.dir, c.appendOnly, c.fsync, ClusterConfig.parse(nodeId, members));
+    }
+
+    private static int parseNodeId(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("invalid node id " + value);
+        }
     }
 
     private static int parsePort(String value) {

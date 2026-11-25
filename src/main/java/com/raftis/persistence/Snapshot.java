@@ -11,7 +11,10 @@ import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.FileOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,7 +43,7 @@ import java.util.zip.CheckedOutputStream;
  * <p>Note: Redis takes snapshots in the background by calling fork() and letting the OS share
  * memory copy-on-write. The JVM can't fork, so SAVE here blocks the server while it writes.
  */
-final class Snapshot {
+public final class Snapshot {
     private static final byte[] MAGIC = {'R', 'A', 'F', 'T', 'I', 'S'};
     private static final int VERSION = 1;
     private static final int STRING = 0, LIST = 1, HASH = 2, ZSET = 3, END = 0xFF;
@@ -49,28 +52,54 @@ final class Snapshot {
 
     static void write(Path dir, String name, Keyspace db, long nextGeneration) throws IOException {
         Path tmp = dir.resolve("temp-" + ProcessHandle.current().pid() + ".snapshot");
-        CRC32 crc = new CRC32();
         try (FileOutputStream file = new FileOutputStream(tmp.toFile())) {
-            DataOutputStream out = new DataOutputStream(
-                    new BufferedOutputStream(new CheckedOutputStream(file, crc), 1 << 16));
-            out.write(MAGIC);
-            out.writeInt(VERSION);
-            out.writeLong(nextGeneration);
-            out.writeLong(System.currentTimeMillis());
-            for (Map.Entry<ByteKey, Object> e : db.entries()) {
-                ByteKey key = e.getKey();
-                if (db.isExpired(key)) continue;
-                writeEntry(out, key, db.expireAt(key), e.getValue());
-            }
-            out.writeByte(END);
-            out.flush();
-            file.write(ByteBuffer.allocate(Long.BYTES).putLong(crc.getValue()).array());
+            encodeTo(file, db, nextGeneration, true);
             file.getFD().sync();
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(tmp);
             throw e;
         }
         Files.move(tmp, dir.resolve(name), StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /**
+     * The whole dataset as bytes, for Raft snapshots. Expired keys are kept: dropping them would
+     * depend on this machine's clock, and every node's snapshot must describe the same state.
+     */
+    public static byte[] toBytes(Keyspace db) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try {
+            encodeTo(bytes, db, 0, false);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return bytes.toByteArray();
+    }
+
+    /** Loads bytes from {@link #toBytes} into an empty keyspace. */
+    public static void fromBytes(byte[] snapshot, Keyspace db) {
+        try {
+            decode(snapshot, db, "raft snapshot");
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static void encodeTo(OutputStream target, Keyspace db, long generation, boolean skipExpired) throws IOException {
+        CRC32 crc = new CRC32();
+        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new CheckedOutputStream(target, crc), 1 << 16));
+        out.write(MAGIC);
+        out.writeInt(VERSION);
+        out.writeLong(generation);
+        out.writeLong(System.currentTimeMillis());
+        for (Map.Entry<ByteKey, Object> e : db.entries()) {
+            ByteKey key = e.getKey();
+            if (skipExpired && db.isExpired(key)) continue;
+            writeEntry(out, key, db.expireAt(key), e.getValue());
+        }
+        out.writeByte(END);
+        out.flush();
+        target.write(ByteBuffer.allocate(Long.BYTES).putLong(crc.getValue()).array()); // not part of the checksum
     }
 
     private static void writeEntry(DataOutputStream out, ByteKey key, long expireAt, Object value) throws IOException {
@@ -117,7 +146,10 @@ final class Snapshot {
 
     /** Loads a snapshot into {@code db}. Returns the AOF generation that follows it. */
     static long read(Path path, Keyspace db) throws IOException {
-        byte[] all = Files.readAllBytes(path);
+        return decode(Files.readAllBytes(path), db, path.toString());
+    }
+
+    private static long decode(byte[] all, Keyspace db, String path) throws IOException {
         int bodyLength = all.length - Long.BYTES;
         if (bodyLength < MAGIC.length + Integer.BYTES + 2 * Long.BYTES + 1) {
             throw new IOException("snapshot " + path + " is truncated");

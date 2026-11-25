@@ -10,6 +10,7 @@ import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -38,6 +39,16 @@ public final class Connection {
     private boolean open = true;
     private String name;
 
+    // Cluster mode. Replies must go out in the order commands arrived, so:
+    //  - consecutive writes are proposed right away (Raft applies them in log order, so their
+    //    replies come back in order), and inflightWrites counts the ones not yet answered;
+    //  - any other command waits (deferred) until those writes are answered;
+    //  - while blocked, no further input is parsed.
+    private ReadMode readMode = ReadMode.CONSISTENT;
+    int inflightWrites;
+    List<byte[]> deferred;
+    boolean blocked;
+
     Connection(long id, SocketChannel channel) {
         this.id = id;
         this.channel = channel;
@@ -53,6 +64,14 @@ public final class Connection {
 
     public void setName(String name) {
         this.name = name;
+    }
+
+    public ReadMode readMode() {
+        return readMode;
+    }
+
+    public void setReadMode(ReadMode readMode) {
+        this.readMode = readMode;
     }
 
     public boolean isSubscribed() {

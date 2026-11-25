@@ -1,134 +1,193 @@
 # raftis
 
-A Redis-compatible in-memory database written from scratch in plain Java 21, with no frameworks.
+A Redis-compatible database written from scratch in plain Java 21 (no frameworks). It **replicates data across nodes with the Raft consensus algorithm**, so a write is acknowledged only once a majority of nodes has it on disk.
 
-It speaks Redis's wire protocol, so the real `redis-cli`, `redis-benchmark` and client libraries such as Jedis work with it unchanged. Writes are saved to disk with an append-only log and snapshots, and crash tests check that **no acknowledged write is lost, even when the process is killed with `kill -9`.**
-
-> **Roadmap:** the next milestone is Raft consensus, which would replicate data across several nodes and fail over automatically without losing acknowledged writes (see [Roadmap](#roadmap)). Today raftis runs as a single node.
+Plain Redis replicates asynchronously, so a failover can lose writes the client was already told succeeded. Here, killing the leader with `kill -9` loses nothing: the cluster elects a new leader in about 200 ms and keeps serving. Real `redis-cli`, `redis-benchmark` and client libraries such as Jedis work with it unchanged.
 
 ## Quickstart
 
+**A 3-node cluster on one machine:**
+
 ```bash
 ./gradlew installDist
-build/install/raftis/bin/raftis --port 6380 --dir ./data
+scripts/cluster.sh start          # nodes on client ports 6380, 6381, 6382
+scripts/cluster.sh status         # shows which node is the leader
 
-# in another terminal
-redis-cli -p 6380
-127.0.0.1:6380> SET greeting hello EX 60
-OK
-127.0.0.1:6380> ZADD leaderboard 100 alice 250 bob 175 carol
-(integer) 3
-127.0.0.1:6380> ZRANGE leaderboard 0 -1 WITHSCORES
-1) "alice"
-2) "100"
-3) "carol"
-4) "175"
-5) "bob"
-6) "250"
+redis-cli -p 6380 SET greeting hello       # on a follower you'll get: NOTLEADER 127.0.0.1:<leader port>
+scripts/cluster.sh kill 2                  # SIGKILL a node (try the leader)
+scripts/cluster.sh status                  # a new leader is elected in ~200 ms; no data lost
+scripts/cluster.sh restart 2               # it rejoins and catches up automatically
+scripts/cluster.sh stop
 ```
 
-Options: `--port`, `--bind`, `--dir`, `--appendonly yes|no`, `--appendfsync always|everysec|no` (run with `--help` to see them all).
+**A single standalone server** (no replication; append-only file for durability):
+
+```bash
+build/install/raftis/bin/raftis --port 6380 --dir ./data
+```
+
+Run `build/install/raftis/bin/raftis --help` to see all options.
 
 ## Features
 
-- **67 commands** across strings, lists, hashes, sorted sets, key expiry, pub/sub and server commands (`INFO`, `CONFIG GET`, `SAVE`, `SHUTDOWN`)
-- **RESP protocol**, including pipelining and inline commands (so `telnet` and `nc` work too)
-- **Key expiry** both lazily (checked on access) and actively (Redis's random-sampling algorithm, so keys nobody reads still get deleted)
-- **Persistence:** an append-only file with `always` / `everysec` / `no` fsync policies, **group commit**, checksummed snapshots and crash-safe file rotation
-- **Exact Redis error messages** (`WRONGTYPE ...`, `ERR wrong number of arguments ...`), so client libraries behave as they do with Redis
+- **68 commands** across strings, lists, hashes, sorted sets, key expiry, pub/sub and server commands. Exact Redis error messages and the RESP protocol (including pipelining), so clients behave as they do with Redis.
+- **Raft replication:**
+  - leader election and log replication
+  - batching and pipelining
+  - log compaction with snapshots, and `InstallSnapshot` for nodes that fall far behind
+  - automatic failover
+- **Linearizable reads** with ReadIndex, no log write needed. `READMODE` lets each connection choose:
+
+  | Mode | Behavior |
+  |---|---|
+  | `CONSISTENT` (default) | linearizable reads via ReadIndex |
+  | `LEADER` | leader reads without confirming it's still the leader |
+  | `STALE` | any node answers, so reads scale but may be behind |
+- **Durability.** In cluster mode, the Raft log with group commit and crash-safe snapshots. In standalone mode, an append-only file (`always` / `everysec` / `no`) with crash-safe snapshot rotation.
+- **Deterministic expiry across nodes.** Keys expire identically on every node, whatever each machine's clock says.
 
 ## Architecture
 
 ```
-            redis-cli / redis-benchmark / Jedis / any Redis client
-                               │  RESP over TCP
-                               ▼
-  ┌──────────────────── one event-loop thread (Java NIO Selector) ────────────────────┐
-  │                                                                                  │
-  │  read socket ──► RespParser ──► CommandTable ──► handler ──► Keyspace (in memory)│
-  │  (partial reads,  (incremental,   (arity, flags)    │          HashMap + TTL index │
-  │   pipelining)      binary-safe)                     │          RList / RHash / ZSet│
-  │                                                     ▼                             │
-  │                                   write commands ──► AOF buffer                   │
-  │                                                                                  │
-  │  end of each loop pass:  1. write AOF buffer + fsync   (group commit)            │
-  │                          2. only then send replies to clients                    │
-  └──────────────────────────────────────────────────────────────────────────────────┘
-                               │
-                 data/appendonly.<generation>.aof   data/dump.snapshot
+      redis-cli / Jedis / any Redis client
+                   │ RESP over TCP
+                   ▼
+ ┌─────────────── node (one event-loop thread, Java NIO) ────────────────┐
+ │                                                                       │
+ │  client socket ─► RespParser ─► command ─┬─ write ─► RaftNode.propose │
+ │                                          ├─ read ──► ReadIndex check  │
+ │                                          └─ local (PING, INFO...)     │
+ │                                                                       │
+ │  RaftNode (pure state machine: no threads, no I/O, no clock)          │
+ │     ▲ tick() every 10 ms        │ messages                             │
+ │     │ step(message)             ▼                                      │
+ │  PeerTransport (TCP) ◄──► other nodes                                 │
+ │                                                                       │
+ │  each loop pass:  fsync Raft log once (group commit)                  │
+ │                   → then send Raft messages → then reply to clients   │
+ │                                                                       │
+ │  committed entries ─► RaftKv.apply ─► Keyspace (in memory)            │
+ └───────────────────────────────────────────────────────────────────────┘
+          data/raft-log   data/raft-state   data/raft-snapshot
 ```
 
 | Package | What it does |
 |---|---|
-| `server` | NIO event loop, connections, pub/sub, configuration |
+| `raft` | Raft core (`RaftNode`, `RaftLog`), disk storage, TCP transport, message encoding |
+| `server` | NIO event loop, connections, `RaftKv` (connects Raft to the commands), pub/sub |
 | `protocol` | Incremental RESP parser and reply writer |
-| `command` | Command table and the handlers, one file per data type |
+| `command` | Command table and handlers, one file per data type |
 | `store` | Keyspace, expiry index, circular-array list, skip-list sorted set |
-| `persistence` | Append-only file, snapshots, recovery |
+| `persistence` | Standalone mode: append-only file and snapshots |
 
-## Design decisions and trade-offs
+## Design decisions
 
-**One thread, no locks.** Like Redis, a single thread runs every command, so each command is atomic and the data structures need no locks. It's fast because commands are in-memory operations taking microseconds, and the NIO `Selector` means the thread never waits on one slow client. The cost is that a single core does all the work, and one slow command (for example `KEYS *` on a huge dataset) stalls every client.
+### Raft
 
-**Never reply before the write is on disk, but share the fsync.** Replies are only sent at the end of an event-loop pass, *after* that pass's writes have been written to the log (and fsynced in `always` mode). One fsync covers every write in the batch. With fsync on every write, throughput scales from **267 ops/sec with 1 client to 23,700 ops/sec with 200 clients** at almost the same latency ([BENCHMARKS.md](BENCHMARKS.md)).
+**Raft as a pure state machine.** `RaftNode` has no threads, sockets or clock. The event loop feeds it ticks and messages and sends what it outputs, the way etcd's Raft library works. That keeps all Raft state on one thread with no locks, and it makes the code fully deterministic, which is what the simulation tests depend on.
 
-**Log effects, not commands.** `EXPIRE k 10` is logged as `PEXPIREAT k <absolute ms>`, and `SET k v EX 10` as `SET k v PXAT <absolute ms>`. Otherwise, replaying the log tomorrow would give every key a fresh TTL. Conditional commands such as `SET NX` are logged as their effect (a plain `SET`) or not at all.
+**Persist before you speak.** Raft requires the term, vote and log to be on disk before a node sends any message that depends on them. Every outgoing message is held until the loop pass's single `fsync`, so this holds by construction, and one fsync covers every entry in the pass (group commit).
 
-**Time stands still during replay.** While the log is being replayed, no key expires. This rebuilds exactly the state that existed, including keys whose TTL passed while the server was down. Those keys are expired normally once loading finishes. (Without this rule, replaying `SET k 5 PXAT <past>` followed by `INCR k` would create `k = 1` with no TTL.)
+**The no-op and Figure 8.** A new leader appends a no-op entry and only counts replicas for entries from its own term. Figure 8 of the Raft paper shows that an older-term entry stored on a majority can still be overwritten, so counting it as committed would lose data. The no-op also lets ReadIndex start working right away.
 
-**Crash-safe snapshots through generations.** AOF files are named `appendonly.<generation>.aof`, and each snapshot records which generation follows it. `SAVE` creates the next AOF, writes the snapshot to a temp file, fsyncs it, then **atomically renames** it into place. That rename is the commit point. A crash on either side of it never loses a write or applies one twice. Redis 7 solved the same problem with a manifest file.
+**ReadIndex instead of logging reads.** The leader records its commit index, confirms it's still the leader through one round of heartbeats acknowledged by a majority, waits until it has applied up to that index, and then reads from memory. Reads arriving close together share one confirmation round. A deposed leader cut off in a minority can never serve a stale `CONSISTENT` read.
 
-**Why SAVE blocks.** Redis snapshots in the background by calling `fork()` and letting the OS share memory copy-on-write. The JVM can't fork, so `SAVE` pauses the server while it writes. A real fix would need copy-on-write data structures.
+### Making every node identical
 
-**A hand-written skip list.** Sorted sets use a skip list where each pointer also records how many nodes it skips (its "span"), as in Redis. Adding up spans gives `ZRANK` in O(log n). `TreeMap` and `ConcurrentSkipListMap` can't answer rank queries faster than O(n).
+**Time comes from the log.** The leader stamps every entry with its clock reading, and every node applies the entry as if it were that moment. So `SET k v EX 10`, `INCR` on a key that's about to expire and `SET NX` make identical decisions on every node. Without this, each machine's clock would decide differently and the replicas would drift apart.
 
-**O(1) random sampling for expiry.** Active expiry needs random keys that have a TTL, and a `HashMap` can't produce one in O(1). Keys with a TTL are also kept in an array with an index map, using swap-with-last to remove in O(1).
+**Expiry goes through the log.** Reads never delete expired keys; they just report them as missing. The leader finds expired keys and proposes an internal `RAFTIS.EXPIRE k...`, which each node applies by re-checking those keys at the entry's timestamp. A plain `DEL` would be wrong: it could delete a newer value written after the leader noticed the expiry.
 
-**Binary-safe throughout.** Keys and values are `byte[]`, never `String`. Since `byte[]` can't be a `HashMap` key (arrays use identity equality), keys are wrapped in `ByteKey`, which compares contents and caches its hash.
+### Talking to clients
+
+**Replies stay in order, and writes still pipeline.** A client's consecutive writes all go into the log at once; Raft applies them in log order, so their replies come back in order. A read or other command after a write waits until the writes before it have been answered.
+
+**Honest failure replies.** There are two kinds of failed write:
+- `ERR ... not applied ... safe to retry` means a different entry took that log slot, so the command can never apply.
+- `UNCERTAIN ...` means the leader lost leadership before confirming, so the write may or may not have applied.
+
+### Durability on disk
+
+**Crash-safe storage.** Log records carry CRC32 checksums, and a record torn by a crash is cut off at startup. It was never acknowledged, because nothing is sent before fsync. The term, vote and snapshots are written to a temp file, fsynced, then atomically renamed into place.
+
+### Standalone mode
+
+This is single-node mode, without Raft.
+- **One thread, no locks,** like Redis. Replies are sent only after the append-only file is written (group commit).
+- **Effects are logged, not commands:** relative TTLs are stored as absolute times.
+- **Snapshots rotate the append-only file safely,** using generation-numbered files.
+- **Sorted sets use a hand-written skip list** that tracks how many nodes each pointer skips, so `ZRANK` is O(log n). `TreeMap` can't find a rank faster than O(n).
 
 ## Testing
 
 ```bash
-./gradlew test                              # 28 tests, about 15 seconds
-./gradlew test -Draftis.crashRuns=100       # crash test with 100 kill -9 runs
+./gradlew test                                                  # 44 tests, about 25 s
+./gradlew test --tests '*RaftSimulationTest*' -Draftis.simSeeds=3000
+./gradlew test --tests '*ClusterCrashTest*' -Draftis.clusterCrashRuns=20
 ```
+
+**Deterministic simulation.** `RaftSimulationTest` runs whole 3- and 5-node clusters on simulated time. The simulated network drops, duplicates, delays and reorders messages, and nodes are crashed, quick-rebooted, partitioned and cut off one way, all driven by one seed, so any failure replays exactly. It checks the following continuously:
+
+| Property | Meaning |
+|---|---|
+| Election Safety | at most one leader per term |
+| State Machine Safety | no two nodes ever apply different entries at the same index |
+| Linearizable reads | a read sees every write acknowledged before it started |
+| Durability | every acknowledged write survives |
+| Liveness | the cluster recovers once failures stop |
+
+> **3000 simulated clusters, with 4.09 million acknowledged writes, 1.12 million linearizable reads and 59,009 injected faults. No violations.**
+
+**Testing the tests.** I planted 6 classic Raft bugs one at a time to check that the tests catch them:
+
+| Planted bug | Caught by |
+|---|---|
+| Voting ignores how up to date the candidate's log is | simulation: State Machine Safety violation |
+| ReadIndex skips the majority confirmation | simulation: stale read detected |
+| Committing without a majority | simulation: State Machine Safety violation |
+| A delayed message truncates entries the node already has | simulation: "would delete committed entry" check |
+| **Committing an old-term entry by counting replicas (Figure 8)** | **`RaftScenarioTest`**: Figure 8 rebuilt step by step |
+| **The vote isn't saved to disk before replying** | **`RaftScenarioTest`**: a node votes, reboots, and is asked again |
+
+The random simulation missed the last two in thousands of runs, because each needs an exact sequence of events. That's why they have hand-written scenario tests.
+
+**Real processes and real disks:**
 
 | Test | What it proves |
 |---|---|
-| `RespParserTest` | Cuts a command at **every byte position** and checks the parser waits for the rest. Also covers pipelining, binary values containing `\r\n`, and malformed input. |
-| `ZSetTest` | 50,000 random operations on the skip list checked against a simple reference implementation (ordering, ranks, score ranges). |
-| `KeyspaceTest` | TTL edge cases with a fake clock, active expiry, and time standing still during replay. |
-| `ServerIntegrationTest` | Every data type through **Jedis**, a real Redis client, including pub/sub. |
-| `PersistenceTest` | Restarts with every data type, snapshot plus newer AOF entries, a log cut off mid-command, and rejection of a corrupted snapshot (CRC32). |
-| `CrashRecoveryTest` | Runs the server as a separate process, `INCR`s as fast as possible, **SIGKILLs it at a random moment** (sometimes during a `SAVE`), restarts it, and checks no acknowledged increment was lost. **100 out of 100 runs pass.** With the AOF disabled, the same crash loses every write, which shows the test can detect data loss. |
-
-Limitation: `kill -9` simulates a process crash, not a power cut. Data the OS has accepted but not yet flushed survives a process crash, so this test can't tell `always` apart from `no`. Testing real power loss needs fault injection at the disk level.
+| `ClusterCrashTest` | 3 server processes. A client `INCR`s as fast as it can while the leader is **SIGKILLed at random moments** (20 rounds passed). Every acknowledged increment survives. |
+| `ClusterIntegrationTest` | A 3-node cluster through Jedis: redirects, stale reads, losing the leader, expiry replicated through the log, a lagging node catching up through `InstallSnapshot`, and restarting the whole cluster. |
+| `FileRaftStorageTest` | Torn-record repair, truncation, snapshots, CRC rejection, message encoding. |
+| `CrashRecoveryTest` | Standalone mode: **100 out of 100** `kill -9` runs with no acknowledged write lost. |
+| Parser, skip list, keyspace and Jedis tests | Cover the single-node basics. |
 
 ## Benchmarks
 
-Measured on an Apple M4 Pro (12 cores) against Redis 8.12, with `redis-benchmark` on the same machine, 50 clients and 1M random keys. Full method and raw results: [BENCHMARKS.md](BENCHMARKS.md).
+Measured on an Apple M4 Pro with all 3 nodes on **one laptop, sharing one SSD**, using `redis-benchmark` on the same machine. Full results: [BENCHMARKS.md](BENCHMARKS.md).
 
-| | Redis 8.12 | raftis |
+| 3-node cluster | ops/sec | p50 latency |
 |---|---|---|
-| SET, no pipelining | ~120–136k ops/s | ~142–152k ops/s |
-| GET, no pipelining | ~125–141k ops/s | ~128–146k ops/s |
-| SET, 16 pipelined | ~0.95–1.0M ops/s | ~1.28–1.57M ops/s |
-| GET, 16 pipelined | ~1.13–1.22M ops/s | ~1.41–1.48M ops/s |
-| Memory for ~950k small keys | **70 MB** | **555 MB** |
+| `SET`, 1 client | ~100 | 12–13 ms |
+| `SET`, 50 clients | ~1,140–1,260 | 52–61 ms |
+| `SET`, 200 clients | ~4,670–4,750 | 54–57 ms |
+| `SET`, 50 clients, 16 pipelined | ~17,500–17,900 | 59–60 ms |
+| `GET`, 50 clients, linearizable (ReadIndex) | **~96,000–98,000** | **0.5–0.6 ms** |
+| Failover after `kill -9` of the leader | **171–264 ms** (5 runs) | |
 
-**How to read this honestly:** without pipelining, both are limited by network round trips and perform about the same. With pipelining, raftis is ahead because **it does much less work per command**: Redis also handles ACLs, keyspace notifications, memory accounting, client-side caching, latency tracking and much more. That doesn't make raftis "faster than Redis" in general. **Memory is the real cost of Java:** every key carries several objects with headers, so raftis uses about 8x more memory than Redis for small keys.
+**Why writes are slow here, and why that's the disk, not Raft.** Every write needs an fsync on the leader and on a follower, about 4 ms each on this Mac, and the three processes take turns on the same SSD. With fsync turned off (`--appendfsync no`, for measurement only, because it gives up durability on power loss), the same cluster does **~87,000–105,000 writes/sec, or ~530,000 pipelined**, at 0.5 ms p50. On real servers, each node has its own disk.
+
+Standalone mode vs Redis 8.12: about equal without pipelining (both are limited by network round trips), and faster with pipelining because raftis does far less work per command. raftis also uses **about 8x more memory** because of Java object overhead. Details are in BENCHMARKS.md.
 
 ## Limitations
 
-- Single node only; replication is the next milestone
-- One database (no `SELECT 1`) and no authentication. It binds to `127.0.0.1` by default for that reason.
-- `SAVE` blocks while writing (the JVM has no `fork()`)
-- The AOF is fully read into memory on startup, so it must be under 2 GB
-- No transactions (`MULTI`/`EXEC`), Lua scripting, blocking commands (`BLPOP`), streams or cluster mode
+- **No membership changes.** The node list is fixed at startup; adding or removing nodes needs joint consensus.
+- **No PreVote or CheckQuorum.** A node that rejoins after a partition can force an unnecessary election.
+- **Retries can apply twice.** A client that retries after an `UNCERTAIN` reply can apply an `INCR` twice. The fix is client sessions with sequence numbers (Raft thesis §6.3).
+- **Snapshots block.** They are taken on the event loop and sent as one message, not in chunks.
+- **Single machine only so far.** The cluster has been tested on one machine, not across a real network with real partitions. That's Phase 4.
+- **Narrower feature set than Redis.** Pub/sub stays on one node, there's no auth and only one database. There's no `MULTI`/`EXEC`, Lua scripting or cluster sharding.
 
 ## Roadmap
 
-1. **Raft replication.** Leader election, log replication and snapshots, with the Raft log replacing the AOF, so a write is acknowledged only once a majority of nodes has it.
-2. **Linearizable reads** using ReadIndex, plus tunable read consistency (`CONSISTENT` / `LEADER` / `STALE`).
-3. **Chaos testing.** Kill, pause and partition nodes in Docker while recording every operation, then check the history with the Porcupine linearizability checker.
-4. **Observability.** Prometheus metrics and a live cluster visualizer.
+1. **Chaos testing:** Docker, network partitions, and history checking with the Porcupine linearizability checker
+2. **Observability:** Prometheus metrics and a live cluster visualizer (kill a node and watch the cluster recover)

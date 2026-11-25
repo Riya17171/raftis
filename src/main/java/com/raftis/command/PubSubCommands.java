@@ -7,6 +7,7 @@ import com.raftis.store.ByteKey;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.raftis.command.CommandSpec.LOCAL;
 import static com.raftis.command.CommandSpec.PUBSUB;
 
 /** SUBSCRIBE, UNSUBSCRIBE, PUBLISH. Messages aren't stored, so these never go to the log. */
@@ -14,9 +15,10 @@ final class PubSubCommands {
     private PubSubCommands() {}
 
     static void register(CommandTable t) {
-        t.add("subscribe", -2, PUBSUB, PubSubCommands::subscribe);
-        t.add("unsubscribe", -1, PUBSUB, PubSubCommands::unsubscribe);
-        t.add("publish", 3, 0, PubSubCommands::publish);
+        // Pub/sub is per node, like in Redis without cluster mode: messages aren't replicated.
+        t.add("subscribe", -2, PUBSUB | LOCAL, PubSubCommands::subscribe);
+        t.add("unsubscribe", -1, PUBSUB | LOCAL, PubSubCommands::unsubscribe);
+        t.add("publish", 3, LOCAL, PubSubCommands::publish);
     }
 
     private static void subscribe(Context ctx, List<byte[]> a) {
