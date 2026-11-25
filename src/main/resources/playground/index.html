@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raftis playground</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276%27 fill=%27%2322c55e%27/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --panel: #111726;
+    --panel-2: #0d1322;
+    --border: #1e2840;
+    --text: #e6e9f2;
+    --muted: #8a93a8;
+    --faint: #5b6580;
+    --leader: #22c55e;
+    --follower: #3b82f6;
+    --candidate: #f59e0b;
+    --frozen: #67e8f9;
+    --stale: #86efac;
+    --down: #475069;
+    --cut: #ef4444;
+    --link: #7c8db5;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  button { font: inherit; color: inherit; }
+
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 24px;
+    border-bottom: 1px solid var(--border); background: var(--panel-2); flex-wrap: wrap; }
+  .brand { font-weight: 700; font-size: 18px; letter-spacing: -0.01em; }
+  .brand span { color: var(--muted); font-weight: 500; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-radius: 999px; border: 1px solid var(--border); background: var(--panel); font-weight: 600; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--leader); box-shadow: 0 0 10px var(--leader); }
+  .pill.electing .dot { background: var(--candidate); box-shadow: 0 0 10px var(--candidate); animation: blink 0.8s infinite; }
+  @keyframes blink { 50% { opacity: 0.25; } }
+
+  .toolbar { display: flex; gap: 8px; padding: 14px 24px; flex-wrap: wrap; align-items: center; }
+  .btn { border: 1px solid var(--border); background: var(--panel); padding: 8px 14px; border-radius: 8px;
+    cursor: pointer; font-weight: 600; transition: background 0.15s, border-color 0.15s; }
+  .btn:hover { background: #18213a; border-color: #2c3a5e; }
+  .btn.danger:hover { border-color: var(--cut); }
+  .btn.cool:hover { border-color: var(--frozen); }
+  .btn.good:hover { border-color: var(--leader); }
+  .toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 10px; color: var(--muted); cursor: pointer; user-select: none; }
+  .switch { width: 40px; height: 22px; border-radius: 999px; background: var(--down); position: relative; transition: background 0.2s; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+    background: white; transition: transform 0.2s; }
+  .toggle.on .switch { background: var(--leader); }
+  .toggle.on .switch::after { transform: translateX(18px); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; padding: 0 24px 24px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } .toggle { margin-left: 0; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+  .stage { position: relative; padding: 8px; align-self: start; position: sticky; top: 16px; }
+  @media (max-width: 1000px) { .stage { position: relative; top: 0; } }
+  svg#cluster { width: 100%; height: auto; display: block; max-height: 74vh; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; padding: 4px 8px 0; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .hint { margin-left: auto; color: var(--faint); }
+
+  .node { cursor: pointer; }
+  .node .body { transition: fill 0.25s, stroke 0.25s; }
+  .node .halo { fill: none; stroke: var(--leader); stroke-width: 2; opacity: 0; }
+  .node.leader .halo { opacity: 0.55; animation: pulse 1.6s ease-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes pulse { from { transform: scale(0.92); opacity: 0.6; } to { transform: scale(1.18); opacity: 0; } }
+  .node text { pointer-events: none; }
+  .name { font: 700 22px system-ui, sans-serif; fill: white; }
+  .role { font: 700 9.5px system-ui, sans-serif; letter-spacing: 0.12em; fill: rgba(255,255,255,0.85); }
+  .stat { font: 12px var(--mono); fill: var(--muted); paint-order: stroke; stroke: var(--panel); stroke-width: 5px; stroke-linejoin: round; }
+  .stat.strong { fill: var(--text); }
+
+  .link-hit { stroke: transparent; stroke-width: 22; cursor: pointer; }
+  .link-hit:hover + g .dir { stroke-width: 3; }
+  .dir { stroke: var(--link); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 2 10; fill: none;
+    animation: flow 1s linear infinite; transition: opacity 0.4s; }
+  .dir.cut { stroke: var(--cut); stroke-dasharray: 7 6; animation: none; opacity: 0.9 !important; }
+  .dir.idle { animation-play-state: paused; }
+  @keyframes flow { to { stroke-dashoffset: -24; } }
+  .x { stroke: var(--cut); stroke-width: 3; stroke-linecap: round; opacity: 0; transition: opacity 0.2s; }
+  .x.on { opacity: 1; }
+
+  .menu { position: absolute; display: none; flex-direction: column; gap: 4px; padding: 6px; min-width: 190px;
+    background: #151d31; border: 1px solid #2c3a5e; border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); z-index: 5; }
+  .menu.open { display: flex; }
+  .menu .title { padding: 4px 8px 6px; color: var(--muted); font-size: 12px; }
+  .menu button { text-align: left; background: none; border: 0; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+  .menu button:hover { background: #1f2a45; }
+  .menu button small { display: block; color: var(--muted); font-size: 11.5px; }
+
+  .big { font: 700 34px/1 var(--mono); letter-spacing: -0.02em; }
+  .big small { font: 500 14px system-ui, sans-serif; color: var(--muted); letter-spacing: 0; margin-left: 6px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .row b { color: var(--text); font: 600 13px var(--mono); }
+  svg.spark { width: 100%; height: 56px; display: block; margin-top: 10px; }
+  .err { margin-top: 8px; color: var(--candidate); font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 16px; }
+
+  .check { display: flex; align-items: center; gap: 12px; }
+  .badge { font: 700 13px system-ui, sans-serif; padding: 4px 10px; border-radius: 999px; background: rgba(34,197,94,0.14); color: var(--leader); white-space: nowrap; }
+  .badge.bad { background: rgba(239,68,68,0.16); color: var(--cut); }
+
+  table { width: 100%; border-collapse: collapse; font: 12.5px var(--mono); }
+  th { text-align: right; color: var(--faint); font: 600 11px system-ui, sans-serif; text-transform: uppercase; letter-spacing: 0.06em; padding: 0 0 6px; }
+  td { text-align: right; padding: 4px 0; border-top: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  td .r { font: 700 10.5px system-ui, sans-serif; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  .events { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+  .events li { display: grid; grid-template-columns: 62px 10px 1fr; gap: 8px; align-items: baseline; padding: 5px 0; border-top: 1px solid var(--border); font-size: 13px; }
+  .events li:first-child { border-top: 0; }
+  .events time { color: var(--faint); font: 12px var(--mono); }
+  .events .k { width: 8px; height: 8px; border-radius: 50%; background: var(--follower); align-self: center; }
+  .events .k.leader { background: var(--leader); }
+  .events .k.alert { background: var(--candidate); }
+
+  .tips { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+  .tips li { margin: 4px 0; }
+  .tips b { color: var(--text); font-weight: 600; }
+
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #2a1a1f; border: 1px solid var(--cut);
+    color: #fecaca; padding: 10px 16px; border-radius: 8px; display: none; z-index: 10; }
+  .offline { display: none; margin: 0 24px 12px; padding: 10px 14px; border: 1px solid var(--cut); border-radius: 8px; color: #fecaca; background: #2a1a1f; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">raftis <span>playground</span></div>
+  <div class="sub">A real Raft cluster on this machine: break it and watch it recover.</div>
+  <div class="pill" id="pill"><span class="dot"></span><span id="pillText">Connecting…</span></div>
+</header>
+
+<div class="toolbar">
+  <button class="btn danger" data-act="kill" data-node="0">Kill the leader</button>
+  <button class="btn danger" data-act="isolate" data-node="0">Cut the leader off</button>
+  <button class="btn cool" data-act="freeze" data-node="0">Freeze the leader</button>
+  <button class="btn good" data-act="heal">Heal everything</button>
+  <div class="toggle on" id="traffic" role="switch" aria-checked="true" tabindex="0"><span>Client traffic</span><span class="switch"></span></div>
+</div>
+<div class="offline" id="offline">The playground server isn't answering. Is <code>scripts/playground.sh</code> still running?</div>
+
+<main>
+  <section class="card stage" id="stage">
+    <svg id="cluster" viewBox="0 0 640 550" aria-label="Cluster diagram">
+      <g id="links"></g>
+      <g id="nodes"></g>
+    </svg>
+    <div class="legend">
+      <span><i style="background:var(--leader)"></i>Leader</span>
+      <span><i style="background:#14532d;box-shadow:inset 0 0 0 2px var(--leader)"></i>Old leader (cut off, doesn't know yet)</span>
+      <span><i style="background:var(--follower)"></i>Follower</span>
+      <span><i style="background:var(--candidate)"></i>Candidate</span>
+      <span><i style="background:var(--frozen)"></i>Frozen</span>
+      <span><i style="background:var(--down)"></i>Down</span>
+      <span>Log bar: <i style="background:#2f4a7a;border-radius:2px"></i>in snapshot <i style="background:#5b8def;border-radius:2px"></i>committed <i style="background:#f59e0b;border-radius:2px"></i>not yet</span>
+      <span class="hint">Click a node for options · click a link to cut it · moving dots are Raft messages</span>
+    </div>
+    <div class="menu" id="menu"></div>
+  </section>
+
+  <div class="side">
+    <section class="card">
+      <h2>Client traffic</h2>
+      <div class="big" id="ops">0<small>ops/s</small></div>
+      <svg class="spark" id="spark" viewBox="0 0 120 56" preserveAspectRatio="none">
+        <defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0" stop-color="#22c55e" stop-opacity="0.35"/><stop offset="1" stop-color="#22c55e" stop-opacity="0"/>
+        </linearGradient></defs>
+        <path id="sparkArea" fill="url(#g)"/><polyline id="sparkLine" fill="none" stroke="#22c55e" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+      </svg>
+      <div class="row"><span>errors/s (no leader, redirects)</span><b id="errs">0</b></div>
+      <div class="err" id="lastErr"></div>
+    </section>
+
+    <section class="card">
+      <h2>Durability check</h2>
+      <div class="check">
+        <div style="flex:1">
+          <div class="row" style="margin:0"><span>INCRs acknowledged</span><b id="acked">0</b></div>
+          <div class="row"><span>Reads that saw all of them</span><b id="checks">0</b></div>
+        </div>
+        <span class="badge" id="lost">0 lost ✓</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Nodes</h2>
+      <table>
+        <thead><tr><th>Node</th><th>Role</th><th>Term</th><th>Commit</th><th>Snapshot</th><th>fsync</th></tr></thead>
+        <tbody id="table"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>What happened</h2>
+      <ul class="events" id="events"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Try this</h2>
+      <ol class="tips">
+        <li><b>Kill the leader.</b> A new one is elected in a few hundred ms; the durability check stays at 0 lost.</li>
+        <li><b>Cut the leader off.</b> It still thinks it leads, but can't commit; the majority elects a new leader. Heal and watch it step down.</li>
+        <li><b>Freeze a follower for 10 s</b>, then unfreeze it: it catches up, maybe from a snapshot.</li>
+        <li><b>Kill 3 of 5 nodes.</b> Writes stop (no majority). Restart one and they resume.</li>
+      </ol>
+    </section>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const COLORS = { leader: '#22c55e', stale: '#86efac', follower: '#3b82f6', candidate: '#f59e0b', frozen: '#67e8f9', down: '#475069', starting: '#475069' };
+const LABELS = { stale: 'OLD LEADER', down: 'DOWN', frozen: 'FROZEN', starting: 'STARTING' };
+const SVGNS = 'http://www.w3.org/2000/svg';
+const CX = 320, CY = 270, RING = 205, R = 44;
+let state = null, built = 0, positions = {};
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString('en-US');
+
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function build(n) {
+  $('links').innerHTML = ''; $('nodes').innerHTML = '';
+  positions = {};
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + i * 2 * Math.PI / n;
+    positions[i + 1] = { x: CX + RING * Math.cos(a), y: CY + RING * Math.sin(a) };
+  }
+  for (let a = 1; a <= n; a++) for (let b = a + 1; b <= n; b++) {
+    const p = positions[a], q = positions[b];
+    const dx = q.x - p.x, dy = q.y - p.y, len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
+    const ox = -uy * 3.5, oy = ux * 3.5, gap = R + 8;
+    const hit = el('line', { class: 'link-hit', x1: p.x, y1: p.y, x2: q.x, y2: q.y }, $('links'));
+    hit.addEventListener('click', ev => { ev.stopPropagation(); act('link', { from: a, to: b }); });
+    const g = el('g', {}, $('links'));
+    // One line per direction, offset to either side, drawn from sender to receiver so the dots move that way.
+    el('line', { class: 'dir', id: `d${a}-${b}`, x1: p.x + ux * gap + ox, y1: p.y + uy * gap + oy, x2: q.x - ux * gap + ox, y2: q.y - uy * gap + oy }, g);
+    el('line', { class: 'dir', id: `d${b}-${a}`, x1: q.x - ux * gap - ox, y1: q.y - uy * gap - oy, x2: p.x + ux * gap - ox, y2: p.y + uy * gap - oy }, g);
+    const mx = (p.x + q.x) / 2, my = (p.y + q.y) / 2;
+    el('path', { class: 'x', id: `x${a}-${b}`, d: `M${mx - 7} ${my - 7}L${mx + 7} ${my + 7}M${mx + 7} ${my - 7}L${mx - 7} ${my + 7}` }, g);
+  }
+  for (let id = 1; id <= n; id++) {
+    const { x, y } = positions[id];
+    const g = el('g', { class: 'node', id: `n${id}`, transform: `translate(${x} ${y})` }, $('nodes'));
+    el('circle', { class: 'halo', r: R + 8 }, g);
+    el('circle', { class: 'body', r: R, 'stroke-width': 3 }, g);
+    el('text', { class: 'name', 'text-anchor': 'middle', y: 2 }, g).textContent = `N${id}`;
+    el('text', { class: 'role', 'text-anchor': 'middle', y: 19 }, g);
+    el('text', { class: 'stat strong', 'text-anchor': 'middle', y: R + 22 }, g);
+    el('text', { class: 'stat', 'text-anchor': 'middle', y: R + 38 }, g);
+    const bar = el('g', { transform: `translate(-55 ${R + 47})` }, g);
+    el('rect', { width: 110, height: 6, rx: 3, fill: '#1e2840' }, bar);
+    el('rect', { class: 'b-commit', height: 6, rx: 3, fill: '#5b8def' }, bar);
+    el('rect', { class: 'b-snap', height: 6, rx: 3, fill: '#2f4a7a' }, bar);
+    el('rect', { class: 'b-tail', height: 6, fill: '#f59e0b' }, bar);
+    g.addEventListener('click', ev => { ev.stopPropagation(); openMenu(id, g); });
+  }
+  built = n;
+}
+
+function render(s) {
+  if (built !== s.nodes.length) build(s.nodes.length);
+  const maxLog = Math.max(1, ...s.nodes.map(n => n.lastLog));
+  for (const n of s.nodes) {
+    const g = $(`n${n.id}`);
+    const kind = kindOf(n, s);
+    const color = COLORS[kind] || COLORS.down;
+    g.setAttribute('class', `node ${kind}`);
+    const body = g.querySelector('.body');
+    const solid = n.status === 'up' && kind !== 'stale';
+    body.setAttribute('fill', solid ? color : kind === 'stale' ? '#14532d' : n.status === 'frozen' ? '#123a46' : '#1a2135');
+    body.setAttribute('stroke', solid ? lighten(color) : kind === 'stale' ? COLORS.leader : color);
+    body.setAttribute('stroke-dasharray', n.status === 'down' || n.status === 'starting' ? '5 5' : 'none');
+    const texts = g.querySelectorAll('text');
+    texts[0].setAttribute('fill', solid ? 'white' : kind === 'stale' ? COLORS.stale : n.status === 'frozen' ? COLORS.frozen : '#8a93a8');
+    texts[1].textContent = LABELS[kind] || n.role.toUpperCase();
+    texts[1].setAttribute('fill', solid ? 'rgba(255,255,255,0.85)' : kind === 'stale' ? COLORS.stale : n.status === 'frozen' ? COLORS.frozen : '#8a93a8');
+    texts[2].textContent = n.status === 'up' ? `term ${n.term}` : n.status === 'down' ? 'killed' : n.status === 'frozen' ? 'SIGSTOP' : '';
+    texts[3].textContent = n.status === 'up' ? `log ${fmt(n.commit)}` + (n.lastLog > n.commit ? ` +${n.lastLog - n.commit}` : '') : '';
+    const w = v => Math.max(0, Math.min(110, 110 * v / maxLog));
+    const live = n.status === 'up';
+    g.querySelector('.b-snap').setAttribute('width', live ? w(n.snapshot) : 0);
+    g.querySelector('.b-commit').setAttribute('width', live ? w(n.commit) : 0);
+    const tail = g.querySelector('.b-tail');
+    tail.setAttribute('x', live ? w(n.commit) : 0);
+    tail.setAttribute('width', live ? Math.max(0, w(n.lastLog) - w(n.commit)) : 0);
+  }
+  const byId = Object.fromEntries(s.nodes.map(n => [n.id, n]));
+  for (const l of s.links) {
+    const line = $(`d${l.from}-${l.to}`);
+    if (!line) continue;
+    const alive = byId[l.from].status === 'up' && byId[l.to].status !== 'down';
+    let cls = 'dir';
+    if (l.cut) cls += ' cut';
+    else if (!alive || l.rate < 1) cls += ' idle';
+    line.setAttribute('class', cls);
+    const level = l.rate < 1 ? 0 : Math.min(4, Math.floor(Math.log10(l.rate)));
+    line.style.opacity = l.cut ? 0.9 : [0.12, 0.3, 0.45, 0.7, 0.95][level];
+    line.style.animationDuration = ['2s', '1.6s', '1.1s', '0.6s', '0.35s'][level];
+  }
+  for (let a = 1; a <= s.nodes.length; a++) for (let b = a + 1; b <= s.nodes.length; b++) {
+    const both = s.links.find(l => l.from === a && l.to === b)?.cut && s.links.find(l => l.from === b && l.to === a)?.cut;
+    $(`x${a}-${b}`).setAttribute('class', both ? 'x on' : 'x');
+  }
+
+  const pill = $('pill');
+  if (s.leader > 0) { pill.className = 'pill'; $('pillText').textContent = `Leader: node ${s.leader} · term ${s.term}`; }
+  else { pill.className = 'pill electing'; $('pillText').textContent = 'No leader · election in progress'; }
+
+  const t = s.traffic;
+  $('ops').innerHTML = `${fmt(t.on ? t.opsPerSec : 0)}<small>ops/s</small>`;
+  $('errs').textContent = fmt(t.errorsPerSec);
+  $('lastErr').textContent = t.errorsPerSec > 0 ? `last error: ${t.lastError}` : '';
+  $('traffic').classList.toggle('on', t.on);
+  $('traffic').setAttribute('aria-checked', t.on);
+  spark(t.history);
+  $('acked').textContent = fmt(t.acked);
+  $('checks').textContent = fmt(t.checks);
+  const lost = $('lost');
+  lost.textContent = t.lost === 0 ? '0 lost ✓' : `${fmt(t.lost)} LOST`;
+  lost.className = t.lost === 0 ? 'badge' : 'badge bad';
+
+  $('table').innerHTML = s.nodes.map(n => {
+    const kind = kindOf(n, s);
+    const up = n.status === 'up';
+    return `<tr><td>N${n.id} <span style="color:var(--faint)">:${n.clientPort}</span></td>`
+      + `<td><span class="r" style="color:${COLORS[kind] || COLORS.down}">${kind === 'stale' ? 'old leader' : kind}</span></td>`
+      + `<td>${up ? n.term : '–'}</td><td>${up ? fmt(n.commit) : '–'}</td><td>${up ? fmt(n.snapshot) : '–'}</td>`
+      + `<td>${n.fsyncMs > 0 ? n.fsyncMs.toFixed(1) + ' ms' : '–'}</td></tr>`;
+  }).join('');
+
+  $('events').innerHTML = s.events.map(e =>
+    `<li><time>${e.time}</time><span class="k ${e.kind}"></span><span>${escapeHtml(e.text)}</span></li>`).join('');
+}
+
+// A node that says it leads, in an older term than the real leader: cut off, and it doesn't know yet.
+function kindOf(n, s) {
+  if (n.status !== 'up') return n.status;
+  if (n.role === 'leader' && s.leader > 0 && n.id !== s.leader) return 'stale';
+  return n.role;
+}
+
+function spark(h) {
+  if (!h.length) return;
+  const max = Math.max(50, ...h), n = 120, off = n - h.length;
+  const pts = h.map((v, i) => `${off + i},${(54 - 50 * v / max).toFixed(1)}`);
+  $('sparkLine').setAttribute('points', pts.join(' '));
+  $('sparkArea').setAttribute('d', `M${off},56 L${pts.join(' L')} L${n - 1},56 Z`);
+}
+
+function lighten(hex) {
+  const c = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, (c >> 16) + 60), g = Math.min(255, ((c >> 8) & 255) + 60), b = Math.min(255, (c & 255) + 60);
+  return `rgb(${r},${g},${b})`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function openMenu(id, g) {
+  const n = state.nodes.find(x => x.id === id);
+  const m = $('menu');
+  const opts = [];
+  if (n.status === 'up' || n.status === 'starting') {
+    opts.push(['kill', 'Kill (SIGKILL)', 'Crash it, like pulling the plug']);
+    opts.push(['freeze', 'Freeze (SIGSTOP)', 'Like a very long GC pause']);
+    opts.push(['isolate', 'Cut off from the network', 'It keeps running, alone']);
+  }
+  if (n.status === 'frozen') opts.push(['restart', 'Unfreeze (SIGCONT)', 'It resumes, unaware time passed']);
+  if (n.status === 'down') opts.push(['restart', 'Restart', 'Recovers from disk, then catches up']);
+  m.innerHTML = `<div class="title">Node ${id} · client port ${n.clientPort}</div>` +
+    opts.map(([a, label, help]) => `<button data-a="${a}">${label}<small>${help}</small></button>`).join('');
+  m.querySelectorAll('button').forEach(b => b.addEventListener('click', ev => { ev.stopPropagation(); closeMenu(); act(b.dataset.a, { node: id }); }));
+  const box = g.getBoundingClientRect(), stage = $('stage').getBoundingClientRect();
+  m.style.left = `${Math.min(stage.width - 200, box.right - stage.left + 6)}px`;
+  m.style.top = `${Math.max(8, box.top - stage.top)}px`;
+  m.classList.add('open');
+}
+function closeMenu() { $('menu').classList.remove('open'); }
+document.addEventListener('click', closeMenu);
+
+async function act(action, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  try {
+    const r = await fetch(`/api/${action}${qs ? '?' + qs : ''}`, { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    state = await r.json();
+    render(state);
+  } catch (e) {
+    const t = $('toast');
+    t.textContent = e.message.trim() || 'request failed';
+    t.style.display = 'block';
+    clearTimeout(act.timer);
+    act.timer = setTimeout(() => t.style.display = 'none', 2500);
+  }
+}
+
+document.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => {
+  const p = b.dataset.node !== undefined ? { node: b.dataset.node } : {};
+  act(b.dataset.act, p);
+}));
+const toggleTraffic = () => act('traffic', { on: !(state && state.traffic.on) });
+$('traffic').addEventListener('click', toggleTraffic);
+$('traffic').addEventListener('keydown', e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleTraffic(); } });
+
+async function poll() {
+  try {
+    const r = await fetch('/api/state', { cache: 'no-store' });
+    state = await r.json();
+    if (state.nodes) render(state);
+    $('offline').style.display = 'none';
+  } catch (e) {
+    $('offline').style.display = 'block';
+  }
+  setTimeout(poll, 200);
+}
+poll();
+</script>
+</body>
+</html>

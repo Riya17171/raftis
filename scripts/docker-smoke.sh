@@ -26,6 +26,9 @@ stale_get() { # read a node's own copy, even on a follower
 
 leader=$(wait_for_leader)
 echo "leader is on port $leader"
+curl -sf "http://localhost:$((leader + 2801))/metrics" | grep -q '^raftis_raft_role{role="leader"} 1' \
+  || { echo "the leader's /metrics endpoint doesn't report it as leader" >&2; exit 1; }
+echo "metrics endpoint OK"
 for _ in $(seq 1 100); do redis-cli -p "$leader" INCR counter > /dev/null; done
 [ "$(redis-cli -p "$leader" GET counter)" = "100" ]
 echo "100 increments acknowledged"

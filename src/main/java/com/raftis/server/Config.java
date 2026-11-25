@@ -9,18 +9,23 @@ import java.nio.file.Path;
  * Server settings, parsed from command-line flags.
  *
  * @param snapshotEntries cluster mode: take a snapshot after this many log entries (0 = the default)
+ * @param metricsPort     serve Prometheus metrics over HTTP on this port (0 = any free port, -1 = off)
  */
 public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster,
-                     long snapshotEntries) {
+                     long snapshotEntries, int metricsPort) {
 
     /** A standalone (non-cluster) configuration. */
     public Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync) {
-        this(bind, port, dir, appendOnly, fsync, null, 0);
+        this(bind, port, dir, appendOnly, fsync, null, 0, -1);
     }
 
     /** A cluster configuration with default Raft settings. */
     public Config(String bind, int port, Path dir, boolean appendOnly, FsyncPolicy fsync, ClusterConfig cluster) {
-        this(bind, port, dir, appendOnly, fsync, cluster, 0);
+        this(bind, port, dir, appendOnly, fsync, cluster, 0, -1);
+    }
+
+    public Config withMetricsPort(int metricsPort) {
+        return new Config(bind, port, dir, appendOnly, fsync, cluster, snapshotEntries, metricsPort);
     }
 
     public static final String USAGE = """
@@ -30,6 +35,7 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
               --dir <path>                        where data files are stored (default ./data)
               --appendonly yes|no                 log every write to an append-only file (default yes)
               --appendfsync always|everysec|no    when to fsync that log (default everysec)
+              --metrics-port <n>                  serve Prometheus metrics at http://<bind>:<n>/metrics (default off)
 
             cluster mode (Raft replication):
               --node-id <n>                       this node's id
@@ -50,6 +56,7 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
         boolean appendOnly = d.appendOnly;
         FsyncPolicy fsync = d.fsync;
         long snapshotEntries = 0;
+        int metricsPort = -1;
         Integer nodeId = null;
         String members = null;
         for (int i = 0; i < args.length; i++) {
@@ -64,6 +71,7 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
                 case "--appendfsync" -> fsync = FsyncPolicy.parse(value);
                 case "--node-id" -> nodeId = parseInt("node id", value);
                 case "--cluster" -> members = value;
+                case "--metrics-port" -> metricsPort = parsePort(value);
                 case "--snapshot-entries" -> {
                     snapshotEntries = parseInt("--snapshot-entries", value);
                     if (snapshotEntries <= 0) throw new IllegalArgumentException("--snapshot-entries must be positive");
@@ -75,7 +83,7 @@ public record Config(String bind, int port, Path dir, boolean appendOnly, FsyncP
             throw new IllegalArgumentException("--node-id and --cluster must be used together");
         }
         ClusterConfig cluster = nodeId == null ? null : ClusterConfig.parse(nodeId, members);
-        return new Config(bind, port, dir, appendOnly, fsync, cluster, snapshotEntries);
+        return new Config(bind, port, dir, appendOnly, fsync, cluster, snapshotEntries, metricsPort);
     }
 
     private static int parseInt(String what, String value) {

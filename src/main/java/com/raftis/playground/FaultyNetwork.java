@@ -1,4 +1,4 @@
-package com.raftis.chaos;
+package com.raftis.playground;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -11,6 +11,7 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Sits between the nodes: every directed Raft link (node A sending to node B) goes through its
@@ -24,34 +25,45 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Each link carries traffic in one direction only (raftis opens one connection per peer, for
  * sending), so cutting A&rarr;B but not B&rarr;A gives a one-way partition.
+ *
+ * <p>Used by the chaos test and by the playground.
  */
-final class FaultyNetwork implements AutoCloseable {
+public final class FaultyNetwork implements AutoCloseable {
     private final Map<Long, Link> links = new ConcurrentHashMap<>();
 
     /** Creates the proxy for messages from {@code from} to {@code to}; returns the port {@code from} should dial. */
-    int addLink(int from, int to, int targetPort) throws IOException {
+    public int addLink(int from, int to, int targetPort) throws IOException {
         Link link = new Link(from, to, targetPort);
         links.put(key(from, to), link);
         return link.port();
     }
 
-    boolean isCut(int from, int to) {
+    public boolean isCut(int from, int to) {
         return links.get(key(from, to)).cut;
     }
 
-    void cut(int from, int to) {
+    public void cut(int from, int to) {
         links.get(key(from, to)).cut();
     }
 
+    public void heal(int from, int to) {
+        links.get(key(from, to)).heal();
+    }
+
+    /** Bytes delivered from {@code from} to {@code to} so far (not counting dropped ones). */
+    public long bytesDelivered(int from, int to) {
+        return links.get(key(from, to)).delivered.get();
+    }
+
     /** Cuts every link between nodes that share no group. A node may be in several groups (a "bridge"). */
-    void partition(Collection<Set<Integer>> groups) {
+    public void partition(Collection<Set<Integer>> groups) {
         for (Link link : links.values()) {
             boolean together = groups.stream().anyMatch(g -> g.contains(link.from) && g.contains(link.to));
             if (!together) link.cut();
         }
     }
 
-    void healAll() {
+    public void healAll() {
         links.values().forEach(Link::heal);
     }
 
@@ -70,6 +82,7 @@ final class FaultyNetwork implements AutoCloseable {
         private final int targetPort;
         private final ServerSocket server;
         private final Set<Pipe> pipes = ConcurrentHashMap.newKeySet();
+        private final AtomicLong delivered = new AtomicLong();
         volatile boolean cut;
 
         Link(int from, int to, int targetPort) throws IOException {
@@ -156,6 +169,7 @@ final class FaultyNetwork implements AutoCloseable {
                     while ((n = in.read(buf)) >= 0) {
                         if (silent || out == null) continue; // partitioned: the bytes vanish
                         out.write(buf, 0, n);
+                        delivered.addAndGet(n);
                     }
                 } catch (IOException e) {
                     // connection closed on one side

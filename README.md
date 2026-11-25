@@ -8,7 +8,23 @@ Plain Redis replicates asynchronously, so a failover can lose writes the client 
 
 It is tested the way distributed databases are tested in industry: a **Jepsen-style chaos test** partitions the network, crashes and freezes nodes while 10 clients hammer the cluster, and a **linearizability checker** I wrote proves every recorded result could have come from a single correct copy of the data.
 
+![The raftis playground: node 5 was the leader until it was cut off from the network. It still thinks it leads, in term 14, while the other nodes elected node 2 in term 15 and kept committing writes. Node 1 has been killed. The durability check shows no acknowledged write lost.](docs/playground.png)
+
+*The playground (`scripts/playground.sh`): a live 5-node cluster you can break from the browser. Here node 5 was cut off while it was the leader. It still thinks it leads, in term 14, but can't commit anything, while the other nodes elected node 2 in term 15 and kept going. Node 1 has been killed. The durability check confirms no acknowledged write was lost.*
+
 ## Quickstart
+
+**The playground** (needs Java 21+):
+
+```bash
+scripts/playground.sh            # then open http://localhost:8080
+```
+
+It starts 5 real server processes with client traffic flowing. Click a node to kill, freeze (`SIGSTOP`) or restart it, or to cut it off from the network; click a link to cut it. The page shows:
+- each node's role, term and log, updated live;
+- the Raft messages flowing on each link;
+- how long each election took;
+- a durability check that would flag any acknowledged write that went missing.
 
 **A 3-node cluster on one machine:**
 
@@ -58,6 +74,7 @@ Run `build/install/raftis/bin/raftis --help` to see all options.
   | `STALE` | any node answers, so reads scale but may be behind |
 - **Durability.** In cluster mode, the Raft log with group commit and crash-safe snapshots. In standalone mode, an append-only file (`always` / `everysec` / `no`) with crash-safe snapshot rotation.
 - **Deterministic expiry across nodes.** Keys expire identically on every node, whatever each machine's clock says.
+- **Prometheus metrics** (`--metrics-port`): role, term, commit and applied index, each follower's progress, elections, snapshots sent and installed, plus histograms of fsync time and write commit latency.
 
 ## Architecture
 
@@ -92,6 +109,8 @@ Run `build/install/raftis/bin/raftis --help` to see all options.
 | `command` | Command table and handlers, one file per data type |
 | `store` | Keyspace, expiry index, circular-array list, skip-list sorted set |
 | `persistence` | Standalone mode: append-only file and snapshots |
+| `metrics` | Prometheus text format and histograms |
+| `playground` | The browser playground: local cluster processes, fault-injecting network proxy, traffic generator |
 
 ## Design decisions
 
@@ -123,6 +142,27 @@ Run `build/install/raftis/bin/raftis --help` to see all options.
 
 **Crash-safe storage.** Log records carry CRC32 checksums, and a record torn by a crash is cut off at startup. It was never acknowledged, because nothing is sent before fsync. The term, vote and snapshots are written to a temp file, fsynced, then atomically renamed into place.
 
+### Observability
+
+**Metrics from the event loop.** `/metrics` is served by a small non-blocking HTTP handler on the same selector and thread as everything else. It reads the live Raft state directly: no locks, no copied snapshots, and every number in a response comes from the same instant. The two histograms measure the two costs that matter: how long an fsync takes, and how long a write takes from proposal to commit.
+
+The leader of a `scripts/cluster.sh` cluster after `redis-benchmark -t set -n 20000 -c 50`:
+
+```
+$ curl -s localhost:9183/metrics | grep -v '^#' | grep -E 'term|role|commit_index|_sum|_count'
+raftis_raft_term 1
+raftis_raft_role{role="follower"} 0
+raftis_raft_role{role="candidate"} 0
+raftis_raft_role{role="leader"} 1
+raftis_raft_commit_index 20001
+raftis_raft_fsync_seconds_sum 12.172961505999986
+raftis_raft_fsync_seconds_count 1567
+raftis_write_commit_seconds_sum 447.8373900969968
+raftis_write_commit_seconds_count 20000
+```
+
+**Group commit, measured:** 20,000 writes needed only 1,567 fsyncs on the leader, about 13 writes per fsync. Each fsync took 7.8 ms on average, because the 3 processes share one laptop SSD, and a write took 22 ms on average from proposal to commit.
+
 ### Standalone mode
 
 This is single-node mode, without Raft.
@@ -134,7 +174,7 @@ This is single-node mode, without Raft.
 ## Testing
 
 ```bash
-./gradlew test                                                  # 55 tests, about 75 s
+./gradlew test                                                  # 58 tests, about 65 s
 ./gradlew test --tests '*RaftSimulationTest*' -Draftis.simSeeds=3000
 ./gradlew test --tests '*ClusterCrashTest*' -Draftis.clusterCrashRuns=20
 ./gradlew test --tests '*ChaosTest*' -Draftis.chaosSeconds=600  # report in build/chaos/
@@ -213,6 +253,8 @@ A leader cut off from the cluster answered from memory after 4 newer writes had 
 |---|---|
 | `ClusterCrashTest` | 3 server processes. A client `INCR`s as fast as it can while the leader is **SIGKILLed at random moments** (20 rounds passed). Every acknowledged increment survives. |
 | `ClusterIntegrationTest` | A 3-node cluster through Jedis: redirects, stale reads, losing the leader, expiry replicated through the log, a lagging node catching up through `InstallSnapshot`, and restarting the whole cluster. |
+| `PlaygroundTest` | Drives the playground's API like the page does: kill the leader, check a new one takes over the traffic with no lost writes. |
+| `MetricsTest` | `/metrics` on a standalone server and a cluster node: Raft role, commit counts, fsync and latency histograms, HTTP errors. |
 | `FileRaftStorageTest` | Torn-record repair, truncation, snapshots, CRC rejection, message encoding. |
 | `CrashRecoveryTest` | Standalone mode: **100 out of 100** `kill -9` runs with no acknowledged write lost. |
 | Parser, skip list, keyspace and Jedis tests | Cover the single-node basics. |
@@ -246,5 +288,6 @@ Standalone mode vs Redis 8.12: about equal without pipelining (both are limited 
 
 ## Roadmap
 
-1. **Observability:** Prometheus metrics and a live cluster visualizer (kill a node and watch the cluster recover)
-2. **PreVote and CheckQuorum**, so a returning node can't disrupt a healthy leader
+1. **PreVote and CheckQuorum.** A returning node couldn't disrupt a healthy leader, and a cut-off leader would step down on its own.
+2. **Membership changes** (joint consensus), to add and remove nodes without downtime.
+3. **Client sessions**, so retried writes are applied exactly once.

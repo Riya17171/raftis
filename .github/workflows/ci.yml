@@ -8,17 +8,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       - name: Run tests (including a 60 s chaos test)
         run: ./gradlew test --no-daemon -Draftis.chaosSeconds=60
       - name: Upload the chaos test report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chaos-report
           path: build/chaos/
@@ -26,7 +26,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install redis-cli
         run: sudo apt-get update -q && sudo apt-get install -y -q redis-tools
       - name: Start a 3-node cluster with Docker Compose

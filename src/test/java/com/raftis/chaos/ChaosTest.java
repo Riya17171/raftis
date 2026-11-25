@@ -149,7 +149,7 @@ class ChaosTest {
 
             List<Integer> others = new ArrayList<>(List.of(1, 2, 3));
             others.remove(Integer.valueOf(oldLeader));
-            cluster.network.partition(List.of(Set.of(oldLeader), Set.copyOf(others)));
+            cluster.network().partition(List.of(Set.of(oldLeader), Set.copyOf(others)));
             int newLeader = -1;
             long deadline = System.currentTimeMillis() + 10_000;
             while ((newLeader <= 0 || newLeader == oldLeader) && System.currentTimeMillis() < deadline) {
@@ -184,7 +184,7 @@ class ChaosTest {
             }
 
             // After healing, the old leader learns about the new term, steps down and catches up.
-            cluster.network.healAll();
+            cluster.network().healAll();
             deadline = System.currentTimeMillis() + 10_000;
             String caughtUp = null;
             while (!"2".equals(caughtUp) && System.currentTimeMillis() < deadline) {
@@ -228,7 +228,7 @@ class ChaosTest {
             this.history = history;
             this.unexpected = unexpected;
             this.readMode = readMode;
-            this.node = 1 + rnd.nextInt(cluster.size);
+            this.node = 1 + rnd.nextInt(cluster.size());
         }
 
         void stop() {
@@ -258,7 +258,7 @@ class ChaosTest {
                 return true;
             } catch (JedisException e) {
                 disconnect();
-                node = 1 + rnd.nextInt(cluster.size);
+                node = 1 + rnd.nextInt(cluster.size());
                 Thread.sleep(20);
                 return false;
             }
@@ -269,7 +269,7 @@ class ChaosTest {
             // stale cached leader address would. Without this, clients settle on the current leader
             // and nobody ever talks to a deposed leader that is cut off, so its bugs would go unseen.
             if (rnd.nextInt(100) < 5) {
-                switchTo(1 + rnd.nextInt(cluster.size));
+                switchTo(1 + rnd.nextInt(cluster.size()));
                 return;
             }
             String key = KEYS[rnd.nextInt(KEYS.length)];
@@ -300,7 +300,7 @@ class ChaosTest {
                     if (leader > 0) switchTo(leader);
                 } else if (msg.startsWith("CLUSTERDOWN") || msg.startsWith("ERR write was not applied")) {
                     failed.incrementAndGet(); // definitely not applied
-                    switchTo(1 + rnd.nextInt(cluster.size));
+                    switchTo(1 + rnd.nextInt(cluster.size()));
                     Thread.sleep(50);
                 } else {
                     if (!msg.startsWith("UNCERTAIN")) unexpected.add(type + " " + key + ": " + msg);
@@ -309,7 +309,7 @@ class ChaosTest {
             } catch (JedisConnectionException e) {
                 // Timed out or the connection died: the server may or may not have applied it.
                 unknownOutcome(type, key, value, start);
-                switchTo(1 + rnd.nextInt(cluster.size));
+                switchTo(1 + rnd.nextInt(cluster.size()));
             }
         }
 
@@ -367,7 +367,7 @@ class ChaosTest {
         long deadline = System.currentTimeMillis() + 20_000;
         while (System.currentTimeMillis() < deadline) {
             last = null;
-            for (int id = 1; id <= cluster.size && last == null; id++) {
+            for (int id = 1; id <= cluster.size() && last == null; id++) {
                 try (Jedis j = new Jedis("127.0.0.1", cluster.clientPort(id), 2000)) {
                     readMode(j, "STALE");
                     for (Map.Entry<String, String> e : expected.entrySet()) {
@@ -406,7 +406,7 @@ class ChaosTest {
         sb.append("faults injected:\n");
         nemesis.counts().forEach((f, n) -> sb.append(String.format("  %-15s %d%n", f, n)));
         sb.append("\nnodes at the end (counters are since each node's last restart):\n");
-        for (int id = 1; id <= cluster.size; id++) {
+        for (int id = 1; id <= cluster.size(); id++) {
             String info = cluster.info(id);
             sb.append(String.format("  node %d: %s%n", id, info == null ? "not answering" : String.format(
                     "%-8s term %-3s commit index %-6s snapshot index %-6s elections started %-3s snapshots sent %-3s installed %s",

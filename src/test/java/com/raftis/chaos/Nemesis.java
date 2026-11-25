@@ -88,33 +88,33 @@ final class Nemesis implements Runnable {
     }
 
     private void inject(Fault fault) throws Exception {
-        List<Integer> nodes = IntStream.rangeClosed(1, cluster.size).boxed().collect(Collectors.toCollection(ArrayList::new));
+        List<Integer> nodes = IntStream.rangeClosed(1, cluster.size()).boxed().collect(Collectors.toCollection(ArrayList::new));
         Collections.shuffle(nodes, rnd);
-        int majority = cluster.size / 2 + 1;
+        int majority = cluster.size() / 2 + 1;
         switch (fault) {
             case ISOLATE_LEADER -> {
                 int leader = leaderOr(nodes.get(0));
                 List<Integer> rest = new ArrayList<>(nodes);
                 rest.remove(Integer.valueOf(leader));
-                cluster.network.partition(List.of(Set.of(leader), Set.copyOf(rest)));
+                cluster.network().partition(List.of(Set.of(leader), Set.copyOf(rest)));
                 note("partition: leader %d isolated from %s", leader, rest);
             }
             case SPLIT -> {
-                Set<Integer> minority = Set.copyOf(nodes.subList(0, cluster.size - majority));
-                Set<Integer> rest = Set.copyOf(nodes.subList(cluster.size - majority, cluster.size));
-                cluster.network.partition(List.of(minority, rest));
+                Set<Integer> minority = Set.copyOf(nodes.subList(0, cluster.size() - majority));
+                Set<Integer> rest = Set.copyOf(nodes.subList(cluster.size() - majority, cluster.size()));
+                cluster.network().partition(List.of(minority, rest));
                 note("partition: %s | %s", sorted(minority), sorted(rest));
             }
             case BRIDGE -> {
-                int mid = cluster.size / 2;
+                int mid = cluster.size() / 2;
                 Set<Integer> left = Set.copyOf(nodes.subList(0, mid + 1));
-                Set<Integer> right = Set.copyOf(nodes.subList(mid, cluster.size));
-                cluster.network.partition(List.of(left, right));
+                Set<Integer> right = Set.copyOf(nodes.subList(mid, cluster.size()));
+                cluster.network().partition(List.of(left, right));
                 note("bridge: %s | %s, node %d sees both sides", sorted(left), sorted(right), nodes.get(mid));
             }
             case ONE_WAY -> {
                 int node = rnd.nextBoolean() ? leaderOr(nodes.get(0)) : nodes.get(0);
-                for (int other : nodes) if (other != node) cluster.network.cut(node, other);
+                for (int other : nodes) if (other != node) cluster.network().cut(node, other);
                 note("one-way: node %d can hear everyone but nothing it sends arrives", node);
             }
             case KILL_LEADER -> {

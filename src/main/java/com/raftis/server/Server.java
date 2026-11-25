@@ -6,6 +6,7 @@ import com.raftis.command.CommandException;
 import com.raftis.command.CommandSpec;
 import com.raftis.command.CommandTable;
 import com.raftis.command.Context;
+import com.raftis.metrics.PrometheusText;
 import com.raftis.persistence.FsyncPolicy;
 import com.raftis.persistence.Persistence;
 import com.raftis.protocol.ProtocolException;
@@ -59,7 +60,7 @@ import java.util.concurrent.TimeUnit;
  * </ol>
  */
 public final class Server {
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.3.0";
     private static final long EXPIRE_CYCLE_MS = 100;
     private static final long RAFT_TICK_MS = 10;
     private static final int PUBSUB_OUTPUT_LIMIT = 32 * 1024 * 1024; // like Redis's pubsub buffer limit
@@ -91,6 +92,9 @@ public final class Server {
     private FileRaftStorage raftStorage;
     private PeerTransport transport;
     private long nextTick;
+
+    private MetricsHttp metricsHttp; // null unless --metrics-port is set
+    private int metricsPort = -1;
 
     public Server(Config config) {
         this.config = config;
@@ -129,6 +133,11 @@ public final class Server {
                         cluster.selfId(), cluster.members().size(), cluster.self().raftPort(), raft.term(), raft.lastLogIndex());
             }
             Log.info("DB loaded from disk: %d keys in %.3f seconds", db.size(), (System.nanoTime() - t0) / 1e9);
+            if (config.metricsPort() >= 0) {
+                metricsHttp = new MetricsHttp(selector, this::renderMetrics);
+                metricsPort = metricsHttp.bind(new InetSocketAddress(config.bind(), config.metricsPort()));
+                Log.info("metrics at http://%s:%d/metrics", config.bind(), metricsPort);
+            }
         } catch (IOException | RuntimeException e) {
             closeQuietly();
             throw e;
@@ -191,6 +200,10 @@ public final class Server {
                 if (!key.isValid()) continue;
                 if (key.attachment() instanceof PeerTransport.Endpoint) {
                     transport.onReady(key); // Raft traffic between nodes
+                    continue;
+                }
+                if (key.attachment() instanceof MetricsHttp.Endpoint) {
+                    metricsHttp.onReady(key); // a GET /metrics
                     continue;
                 }
                 if (key.isAcceptable()) {
@@ -421,6 +434,7 @@ public final class Server {
 
     private void closeEverything() {
         for (Connection c : new ArrayList<>(clients)) close(c);
+        if (metricsHttp != null) metricsHttp.close();
         closeQuietly();
         try {
             if (raft != null) {
@@ -464,6 +478,53 @@ public final class Server {
 
     public int port() {
         return port;
+    }
+
+    /** The port serving /metrics, or -1 if metrics are off. */
+    public int metricsPort() {
+        return metricsPort;
+    }
+
+    /** Everything /metrics reports, in Prometheus text format. Runs on the event loop. */
+    String renderMetrics() {
+        PrometheusText p = new PrometheusText();
+        p.header("raftis_info", "Version and mode of this server.", "gauge")
+                .sample("raftis_info", "version=\"" + VERSION + "\",mode=\"" + (raft == null ? "standalone" : "cluster") + "\"", 1);
+        p.gauge("raftis_uptime_seconds", "Seconds since the server started.", (System.currentTimeMillis() - startedAt) / 1000.0);
+        p.gauge("raftis_connected_clients", "Client connections currently open.", clients.size());
+        p.counter("raftis_connections_received_total", "Client connections accepted.", totalConnections);
+        p.counter("raftis_commands_processed_total", "Commands executed.", totalCommands);
+        p.gauge("raftis_keys", "Keys in the database, including expired keys not yet removed.", db.size());
+        if (raft == null) return p.toString();
+
+        p.gauge("raftis_raft_node_id", "This node's id.", raft.id());
+        p.gauge("raftis_raft_term", "Current Raft term.", raft.term());
+        p.header("raftis_raft_role", "1 for this node's current role, 0 for the others.", "gauge");
+        for (RaftNode.Role r : RaftNode.Role.values()) {
+            p.sample("raftis_raft_role", "role=\"" + r.name().toLowerCase(java.util.Locale.ROOT) + "\"", raft.role() == r ? 1 : 0);
+        }
+        p.gauge("raftis_raft_leader_id", "The node this node believes is the leader, or -1.", raft.leaderId());
+        p.gauge("raftis_raft_commit_index", "Highest log index known to be committed.", raft.commitIndex());
+        p.gauge("raftis_raft_last_applied", "Highest log index applied to the data.", raft.lastApplied());
+        p.gauge("raftis_raft_last_log_index", "Last index in this node's log.", raft.lastLogIndex());
+        p.gauge("raftis_raft_snapshot_index", "Last log index covered by the snapshot.", raft.snapshotIndex());
+        p.gauge("raftis_raft_connected_peers", "Peers this node has an open connection to.", transport.connectedPeers());
+        p.counter("raftis_raft_elections_started_total", "Elections this node started.", raft.electionsStarted());
+        p.counter("raftis_raft_snapshots_sent_total", "Snapshots sent to followers that fell behind.", raft.snapshotsSent());
+        p.counter("raftis_raft_snapshots_installed_total", "Snapshots received from a leader and installed.", raft.snapshotsInstalled());
+        if (raft.isLeader()) {
+            p.header("raftis_raft_peer_match_index", "Leader only: highest log index known to be on each follower.", "gauge");
+            raft.matchIndexes().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                    .forEach(e -> p.sample("raftis_raft_peer_match_index", "peer=\"" + e.getKey() + "\"", e.getValue()));
+        }
+        p.histogram("raftis_raft_fsync_seconds", "Time to fsync the Raft log to disk.", raftStorage.fsyncSeconds());
+        p.histogram("raftis_write_commit_seconds", "Leader only: time from proposing a client write to applying it.",
+                raftKv.commitLatency);
+        p.header("raftis_client_writes_total", "Client writes by outcome: committed, uncertain (leadership lost), replaced.", "counter");
+        p.sample("raftis_client_writes_total", "result=\"committed\"", raftKv.writesCommitted);
+        p.sample("raftis_client_writes_total", "result=\"uncertain\"", raftKv.writesUncertain);
+        p.sample("raftis_client_writes_total", "result=\"replaced\"", raftKv.writesReplaced);
+        return p.toString();
     }
 
     public int clientCount() {

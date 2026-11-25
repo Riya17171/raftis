@@ -1,5 +1,6 @@
 package com.raftis.raft;
 
+import com.raftis.metrics.Histogram;
 import com.raftis.Log;
 
 import java.io.IOException;
@@ -41,6 +42,7 @@ public final class FileRaftStorage implements RaftStorage {
 
     private final Path dir;
     private final boolean fsync;
+    private final Histogram fsyncSeconds = new Histogram();
     private HardState hardState = new HardState(0, -1);
     private boolean hardStateDirty;
     private RaftSnapshot snapshot;
@@ -208,7 +210,11 @@ public final class FileRaftStorage implements RaftStorage {
                 logNeedsFsync = true;
             }
             if (logNeedsFsync) {
-                if (fsync) log.force(false);
+                if (fsync) {
+                    long t0 = System.nanoTime();
+                    log.force(false);
+                    fsyncSeconds.observeNanos(System.nanoTime() - t0);
+                }
                 logNeedsFsync = false;
             }
             if (hardStateDirty) {
@@ -219,6 +225,11 @@ public final class FileRaftStorage implements RaftStorage {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /** How long each fsync of the log took. */
+    public Histogram fsyncSeconds() {
+        return fsyncSeconds;
     }
 
     @Override

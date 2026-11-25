@@ -1,6 +1,7 @@
 package com.raftis.server;
 
 import com.raftis.command.CommandSpec;
+import com.raftis.metrics.Histogram;
 import com.raftis.persistence.Snapshot;
 import com.raftis.protocol.RespParser;
 import com.raftis.protocol.RespWriter;
@@ -35,7 +36,7 @@ final class RaftKv implements StateMachine {
     private static final String REPLACED = "ERR write was not applied: leadership changed before it was committed; safe to retry";
     private static final byte[] EXPIRE_COMMAND = "RAFTIS.EXPIRE".getBytes(StandardCharsets.US_ASCII);
 
-    private record PendingWrite(long term, Connection conn) {}
+    private record PendingWrite(long term, Connection conn, long proposedAt) {}
 
     private final Server server;
     private final Keyspace db;
@@ -45,6 +46,12 @@ final class RaftKv implements StateMachine {
     private final RespWriter sink = new RespWriter(); // replies nobody is waiting for (applied on followers)
     private RaftNode raft;
     private long expireProposal = -1;
+
+    // Metrics, read by Server for /metrics.
+    final Histogram commitLatency = new Histogram(); // proposal to applied, for client writes
+    long writesCommitted;
+    long writesUncertain;
+    long writesReplaced;
 
     RaftKv(Server server, Keyspace db, ClusterConfig cluster) {
         this.server = server;
@@ -64,7 +71,7 @@ final class RaftKv implements StateMachine {
             return;
         }
         long index = raft.propose(encode(System.currentTimeMillis(), args));
-        pending.put(index, new PendingWrite(raft.term(), c));
+        pending.put(index, new PendingWrite(raft.term(), c, System.nanoTime()));
         c.inflightWrites++;
     }
 
@@ -149,7 +156,12 @@ final class RaftKv implements StateMachine {
         if (waiting != null && waiting.term() != term) {
             // A different entry ended up at this index, so our client's command can never apply.
             failWrite(waiting, REPLACED);
+            writesReplaced++;
             waiting = null;
+        }
+        if (waiting != null) {
+            commitLatency.observeNanos(System.nanoTime() - waiting.proposedAt());
+            writesCommitted++;
         }
         if (index == expireProposal) expireProposal = -1;
         if (command == null) return; // a leader's no-op
@@ -187,6 +199,7 @@ final class RaftKv implements StateMachine {
         List<PendingWrite> all = new ArrayList<>(pending.values()); // in log order, so replies stay ordered
         pending.clear();
         for (PendingWrite p : all) failWrite(p, error);
+        writesUncertain += all.size();
     }
 
     private void failWrite(PendingWrite p, String error) {

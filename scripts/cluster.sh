@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs a local 3-node raftis cluster.
 #   client ports: 6380, 6381, 6382     Raft ports: 7380, 7381, 7382
+#   metrics: http://localhost:9181/metrics, 9182, 9183
 #
 # usage: scripts/cluster.sh start | stop | status | kill <id> | restart <id>
 #   kill <id>     SIGKILLs a node, like a crash or power loss
@@ -15,7 +16,7 @@ DATA=${RAFTIS_CLUSTER_DIR:-cluster-data}
 start_node() {
   local id=$1
   mkdir -p "$DATA/node$id"
-  "$BIN" --node-id "$id" --cluster "$MEMBERS" --dir "$DATA/node$id" >> "$DATA/node$id.log" 2>&1 &
+  "$BIN" --node-id "$id" --cluster "$MEMBERS" --dir "$DATA/node$id" --metrics-port $((9180 + id)) >> "$DATA/node$id.log" 2>&1 &
   echo $! > "$DATA/node$id.pid"
   echo "started node $id (client port $((6379 + id)), pid $!, log $DATA/node$id.log)"
 }
