@@ -1,5 +1,7 @@
 # raftis
 
+[![CI](https://github.com/Riya17171/raftis/actions/workflows/ci.yml/badge.svg)](https://github.com/Riya17171/raftis/actions/workflows/ci.yml)
+
 A Redis-compatible database written from scratch in plain Java 21 (no frameworks). It **replicates data across nodes with the Raft consensus algorithm**, so a write is acknowledged only once a majority of nodes has it on disk.
 
 Plain Redis replicates asynchronously, so a failover can lose writes the client was already told succeeded. Here, killing the leader with `kill -9` loses nothing: the cluster elects a new leader in about 200 ms and keeps serving. Real `redis-cli`, `redis-benchmark` and client libraries such as Jedis work with it unchanged.
